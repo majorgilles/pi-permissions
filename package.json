@@ -12,7 +12,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/majorgilles/pi-permissions.git"
+    "url": "git+https://github.com/majorgilles/pi-permissions.git"
   },
   "homepage": "https://github.com/majorgilles/pi-permissions#readme",
   "bugs": {
