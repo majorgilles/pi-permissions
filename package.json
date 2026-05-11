@@ -33,5 +33,6 @@
   "files": [
     "index.ts",
     "README.md"
-  ]
+  ],
+  "license": "MIT"
 }
