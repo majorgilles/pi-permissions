@@ -1,7 +1,6 @@
 {
   "name": "@majorgilles/pi-permissions",
   "version": "0.1.0",
-  "private": true,
   "description": "Claude-Code-like permission gates for pi tool calls.",
   "type": "module",
   "keywords": [
@@ -14,6 +13,13 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/majorgilles/pi-permissions.git"
+  },
+  "homepage": "https://github.com/majorgilles/pi-permissions#readme",
+  "bugs": {
+    "url": "https://github.com/majorgilles/pi-permissions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "pi": {
     "extensions": [
