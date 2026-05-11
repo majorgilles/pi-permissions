@@ -6,7 +6,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -208,14 +208,15 @@ class SyntaxReviewEditor extends CustomEditor {
 		const lines = super.render(width);
 		if (!this.language || lines.length <= 2) return this.renderVimLabel(lines, width);
 
-		const layout = buildReviewLayout(this.getLines(), width, this.getPaddingX?.() ?? 0);
+		const paddingX = this.getPaddingX?.() ?? 0;
+		const layout = buildReviewLayout(this.getLines(), width, paddingX);
 		const scrollOffset = (this as unknown as { scrollOffset?: number }).scrollOffset ?? 0;
 		const bodyLineCount = Math.max(0, lines.length - 2);
 		for (let i = 0; i < bodyLineCount; i++) {
 			const layoutLine = layout[scrollOffset + i];
-			if (!layoutLine || !layoutLine.text) continue;
-			const styled = this.styleReviewLine(layoutLine.logicalLine, layoutLine.text);
-			if (styled === layoutLine.text) continue;
+			if (!layoutLine) continue;
+			const styled = this.styleReviewLine(layoutLine.logicalLine, layoutLine.visualIndex, layoutLine.layoutWidth);
+			if (!styled || styled === layoutLine.text) continue;
 			const idx = lines[i + 1]!.indexOf(layoutLine.text);
 			if (idx >= 0) {
 				lines[i + 1] = `${lines[i + 1]!.slice(0, idx)}${styled}${lines[i + 1]!.slice(idx + layoutLine.text.length)}`;
@@ -234,21 +235,14 @@ class SyntaxReviewEditor extends CustomEditor {
 		return lines;
 	}
 
-	private styleReviewLine(logicalLine: number, text: string): string {
-		if (this.highlightMode === "write") return highlightCode(text, this.language!, this.syntaxTheme);
-
-		if (text.startsWith("# | ")) {
-			return this.syntaxTheme.fg("muted", "# | ") + highlightCode(text.slice(4), this.language!, this.syntaxTheme);
-		}
-		if (text.startsWith("#")) return this.syntaxTheme.fg("muted", text);
-		if (text === "--- replacement ---") return this.syntaxTheme.fg("accent", text);
-		return logicalLine > findReplacementMarkerLine(this.getLines())
-			? highlightCode(text, this.language!, this.syntaxTheme)
-			: text;
+	private styleReviewLine(logicalLine: number, visualIndex: number, layoutWidth: number): string {
+		const highlighted = buildHighlightedReviewLines(this.getLines(), this.language!, this.highlightMode, this.syntaxTheme);
+		const styledLine = highlighted[logicalLine] ?? this.getLines()[logicalLine] ?? "";
+		return wrapTextWithAnsi(styledLine, layoutWidth)[visualIndex] ?? "";
 	}
 }
 
-type ReviewLayoutLine = { text: string; logicalLine: number };
+type ReviewLayoutLine = { text: string; logicalLine: number; visualIndex: number; layoutWidth: number };
 
 function buildReviewLayout(lines: string[], width: number, paddingX: number): ReviewLayoutLine[] {
 	const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
@@ -257,23 +251,60 @@ function buildReviewLayout(lines: string[], width: number, paddingX: number): Re
 	const layoutWidth = Math.max(1, contentWidth - (actualPaddingX ? 0 : 1));
 	const layout: ReviewLayoutLine[] = [];
 	for (let logicalLine = 0; logicalLine < lines.length; logicalLine++) {
-		for (const text of wrapReviewLine(lines[logicalLine] ?? "", layoutWidth)) {
-			layout.push({ text, logicalLine });
+		const chunks = wrapTextWithAnsi(lines[logicalLine] ?? "", layoutWidth);
+		for (let visualIndex = 0; visualIndex < chunks.length; visualIndex++) {
+			layout.push({ text: chunks[visualIndex] ?? "", logicalLine, visualIndex, layoutWidth });
 		}
 	}
-	return layout.length ? layout : [{ text: "", logicalLine: 0 }];
+	return layout.length ? layout : [{ text: "", logicalLine: 0, visualIndex: 0, layoutWidth }];
 }
 
-function wrapReviewLine(line: string, width: number): string[] {
-	if (visibleWidth(line) <= width) return [line];
-	const chunks: string[] = [];
-	let remaining = line;
-	while (remaining) {
-		const chunk = truncateToWidth(remaining, width, "");
-		chunks.push(chunk);
-		remaining = remaining.slice(chunk.length);
+function buildHighlightedReviewLines(
+	lines: string[],
+	language: string,
+	highlightMode: ReviewHighlightMode,
+	theme: ExtensionContext["ui"]["theme"],
+): string[] {
+	if (highlightMode === "write") return alignHighlightedLines(lines, highlightCode(lines.join("\n"), language));
+
+	const result = [...lines];
+	const markerLine = findReplacementMarkerLine(lines);
+
+	const originalIndexes = lines
+		.map((line, index) => ({ line, index }))
+		.filter(({ line }) => line.startsWith("# | "))
+		.map(({ index }) => index);
+	const originalHighlighted = alignHighlightedLines(
+		originalIndexes.map((index) => lines[index]!.slice(4)),
+		highlightCode(originalIndexes.map((index) => lines[index]!.slice(4)).join("\n"), language),
+	);
+	originalIndexes.forEach((lineIndex, originalIndex) => {
+		result[lineIndex] = theme.fg("muted", "# | ") + (originalHighlighted[originalIndex] ?? lines[lineIndex]!.slice(4));
+	});
+
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i]!.startsWith("# | ")) continue;
+		if (lines[i]!.startsWith("#")) result[i] = theme.fg("muted", lines[i]!);
+		else if (lines[i] === "--- replacement ---") result[i] = theme.fg("accent", lines[i]!);
 	}
-	return chunks;
+
+	if (markerLine >= 0) {
+		const replacementIndexes = lines.map((_, index) => index).filter((index) => index > markerLine);
+		const replacementHighlighted = alignHighlightedLines(
+			replacementIndexes.map((index) => lines[index]!),
+			highlightCode(replacementIndexes.map((index) => lines[index]!).join("\n"), language),
+		);
+		replacementIndexes.forEach((lineIndex, replacementIndex) => {
+			result[lineIndex] = replacementHighlighted[replacementIndex] ?? lines[lineIndex]!;
+		});
+	}
+
+	return result;
+}
+
+function alignHighlightedLines(sourceLines: string[], highlightedLines: string[]): string[] {
+	if (highlightedLines.length === sourceLines.length) return highlightedLines;
+	return sourceLines.map((line, index) => highlightedLines[index] ?? line);
 }
 
 function findReplacementMarkerLine(lines: string[]): number {
