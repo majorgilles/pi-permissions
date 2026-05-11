@@ -1,0 +1,31 @@
+{
+  "name": "@majorgilles/pi-permissions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude-Code-like permission gates for pi tool calls.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "permissions",
+    "guardrails"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/majorgilles/pi-permissions.git"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ]
+}
