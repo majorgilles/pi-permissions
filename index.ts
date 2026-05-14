@@ -68,7 +68,7 @@ type SessionPolicy = {
 
 const DEFAULT_CONFIG: PermissionConfig = {
     version: 1,
-    mode: "ask",
+    mode: "auto",
     bash: {
 		allowExact: [],
 		allowPrefixes: [],
@@ -943,7 +943,7 @@ function ensureConfigFile(file: string) {
 function mergeConfigs(...configs: PermissionConfig[]): EffectivePolicy {
     const merged: EffectivePolicy = {
         version: 1,
-        mode: "ask",
+        mode: "auto",
         bash: { allowExact: [], allowPrefixes: [], denyPatterns: [] },
 		tools: { allow: [] },
 		paths: { denyRead: [], denyWrite: [], sensitive: [] },
@@ -1270,7 +1270,7 @@ function addGlobalRule(mutate: (cfg: PermissionConfig) => void) {
 function mergeConfigForWrite(cfg: PermissionConfig): PermissionConfig {
     return {
         version: cfg.version ?? 1,
-        mode: cfg.mode ?? "ask",
+        mode: cfg.mode ?? "auto",
         bash: {
 			allowExact: cfg.bash?.allowExact ?? [],
 			allowPrefixes: cfg.bash?.allowPrefixes ?? [],

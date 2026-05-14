@@ -2,7 +2,7 @@
 
 Claude-Code-like permission gates for pi tool calls.
 
-This extension lets read-only inspection run without prompts, blocks sensitive file access, and asks before mutating tool calls in the default `ask` mode. It also has a Claude-Code-like full auto mode for sessions where you want safe tool calls accepted automatically while dangerous commands still prompt or block.
+This extension lets read-only inspection run without prompts, blocks sensitive file access, and defaults to Claude-Code-like auto approval for safe tool calls while dangerous commands still prompt or block. A manual `ask` mode is available for sessions where you want mutating tool calls to require approval.
 
 ## Install
 
@@ -34,22 +34,22 @@ If pi is already running, use:
 /reload
 ```
 
-When loaded, the footer/status area shows the active mode:
-
-```text
-permissions: ask
-```
-
-or, when auto mode is enabled:
+When loaded, the footer/status area shows the active mode. By default:
 
 ```text
 permissions: auto
 ```
 
+or, when manual approval mode is enabled:
+
+```text
+permissions: ask
+```
+
 ## Modes
 
-- `ask` (default): manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits show a read-only Claude-Code-style diff approval UI.
-- `auto`: Claude-Code-like full auto approval. Non-sensitive writes/edits, non-denied non-dangerous bash commands (including read-only bash), and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
+- `auto` (default): Claude-Code-like full auto approval. Non-sensitive writes/edits, non-denied non-dangerous bash commands (including read-only bash), and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
+- `ask`: manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits show a read-only Claude-Code-style diff approval UI.
 
 Toggle for the current session:
 
@@ -65,7 +65,7 @@ or:
 /permissions-mode ask
 ```
 
-Ask is the default. To default to full auto instead, set top-level config field `"mode": "auto"`.
+Auto is the default. To force manual approvals by default, set top-level config field `"mode": "ask"`.
 
 ## Default behavior
 
@@ -139,7 +139,7 @@ Example:
 ```json
 {
   "version": 1,
-  "mode": "ask",
+  "mode": "auto",
   "bash": {
     "allowExact": [],
     "allowPrefixes": [],
@@ -173,7 +173,7 @@ Example:
 
 ### Config fields
 
-- `mode`: `"ask"` or `"auto"`; default startup mode (`"ask"` unless configured otherwise). Session commands can override it until reload/restart.
+- `mode`: `"ask"` or `"auto"`; default startup mode (`"auto"` unless configured otherwise). Session commands can override it until reload/restart.
 - `bash.allowExact`: exact commands allowed without prompting. Usually only needed for commands you intentionally want to trust despite not being classified as read-only.
 - `bash.allowPrefixes`: command prefixes allowed without prompting. Prefer narrow prefixes because these bypass ask-mode prompts.
 - `bash.denyPatterns`: regular expressions checked against commands before allow rules.
