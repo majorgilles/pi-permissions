@@ -1,6 +1,6 @@
 {
   "name": "@majorgilles/pi-permissions",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Claude-Code-like permission gates for pi tool calls.",
   "type": "module",
   "keywords": [
@@ -34,5 +34,5 @@
     "index.ts",
     "README.md"
   ],
-  "license": "MIT"
+  "license": "PolyForm-Noncommercial-1.0.0"
 }
