@@ -54,8 +54,8 @@ const DEFAULT_CONFIG: PermissionConfig = {
     version: 1,
     mode: "ask",
     bash: {
-		allowExact: ["pwd", "ls", "git status", "git diff", "git diff --stat"],
-		allowPrefixes: ["rg ", "grep ", "find . ", "ls ", "npm test", "npm run test"],
+		allowExact: [],
+		allowPrefixes: [],
 		denyPatterns: [],
 	},
 	tools: {
@@ -437,6 +437,7 @@ async function handleBash(input: { command: string; timeout?: number }, ctx: Ext
     if (danger.block) return { block: true, reason: danger.reason };
     if (isBashDenied(command)) return { block: true, reason: `Bash blocked by deny pattern: ${command}` };
 
+    if (!danger.confirm && isReadOnlyBashCommand(command)) return;
     if (isBashAllowed(command) && !danger.confirm) return;
     if (currentMode() === "auto" && !danger.confirm) return;
 
@@ -610,6 +611,244 @@ function isBashAllowed(command: string): boolean {
     return effective.bash.allowPrefixes.some((prefix) => command.startsWith(prefix));
 }
 
+const READ_ONLY_SIMPLE_COMMANDS = new Set([
+    "[",
+    "basename",
+    "cat",
+    "cd",
+    "cut",
+    "date",
+    "df",
+    "dir",
+    "dirname",
+    "du",
+    "echo",
+    "expr",
+    "false",
+    "file",
+    "grep",
+    "head",
+    "hostname",
+    "id",
+    "jq",
+    "less",
+    "ls",
+    "more",
+    "printenv",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rg",
+    "stat",
+    "tail",
+    "test",
+    "tr",
+    "true",
+    "uname",
+    "uniq",
+    "wc",
+    "where",
+    "whereis",
+    "which",
+    "whoami",
+]);
+
+function isReadOnlyBashCommand(command: string): boolean {
+    if (!command.trim()) return true;
+    if (/[`]/.test(command) || command.includes("$(") || command.includes("<(") || command.includes(">(")) return false;
+
+    const tokens = tokenizeShell(command);
+    if (!tokens) return false;
+
+    const segments: string[][] = [];
+    let current: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i]!;
+        if (isOutputRedirection(token)) return false;
+        if (token === "<" || token === "<<") {
+            i++;
+            continue;
+        }
+        if (isCommandSeparator(token)) {
+            if (current.length === 0) return false;
+            segments.push(current);
+            current = [];
+            continue;
+        }
+        if (token === "&") return false;
+        current.push(token);
+    }
+    if (current.length) segments.push(current);
+    return segments.length > 0 && segments.every(isReadOnlyCommandSegment);
+}
+
+function tokenizeShell(command: string): string[] | undefined {
+    const tokens: string[] = [];
+    let token = "";
+    let quote: "'" | '"' | undefined;
+
+    const pushToken = () => {
+        if (token) {
+            tokens.push(token);
+            token = "";
+        }
+    };
+
+    for (let i = 0; i < command.length; i++) {
+        const ch = command[i]!;
+        if (quote) {
+            if (ch === quote) quote = undefined;
+            else if (quote === '"' && ch === "\\" && i + 1 < command.length) token += command[++i]!;
+            else token += ch;
+            continue;
+        }
+
+        if (ch === "'" || ch === '"') {
+            quote = ch;
+            continue;
+        }
+        if (ch === "\\") {
+            if (i + 1 >= command.length) return undefined;
+            token += command[++i]!;
+            continue;
+        }
+        if (/\s/.test(ch)) {
+            pushToken();
+            continue;
+        }
+        if (";|&<>".includes(ch)) {
+            pushToken();
+            const next = command[i + 1];
+            if ((ch === "&" && next === "&") || (ch === "|" && next === "|") || (ch === ">" && next === ">") || (ch === "<" && next === "<")) {
+                tokens.push(`${ch}${next}`);
+                i++;
+            } else {
+                tokens.push(ch);
+            }
+            continue;
+        }
+        token += ch;
+    }
+
+    if (quote) return undefined;
+    pushToken();
+    return tokens;
+}
+
+function isCommandSeparator(token: string): boolean {
+    return token === "|" || token === "&&" || token === "||" || token === ";";
+}
+
+function isOutputRedirection(token: string): boolean {
+    return token === ">" || token === ">>";
+}
+
+function isReadOnlyCommandSegment(tokens: string[]): boolean {
+    let index = 0;
+    while (isEnvAssignment(tokens[index])) index++;
+    if (index >= tokens.length) return true;
+
+    if (tokens[index] === "time") index++;
+    if (tokens[index] === "command" || tokens[index] === "builtin") {
+        if (tokens[index + 1] === "-v" || tokens[index + 1] === "-V") return true;
+        index++;
+    }
+
+    const commandName = tokens[index]!;
+    const args = tokens.slice(index + 1);
+
+    if (commandName === "env") return isReadOnlyEnvCommand(args);
+    if (commandName === "find") return isReadOnlyFindCommand(args);
+    if (commandName === "git") return isReadOnlyGitCommand(args);
+    if (commandName === "node" || commandName === "python" || commandName === "python3") return args.length > 0 && args.every(isVersionOrHelpFlag);
+    if (commandName === "npm") return isReadOnlyNpmCommand(args);
+    if (commandName === "sort") return !hasOption(args, "-o", "--output");
+    if (commandName === "yq") return !hasOption(args, "-i", "--inplace");
+
+    return READ_ONLY_SIMPLE_COMMANDS.has(commandName);
+}
+
+function isReadOnlyEnvCommand(args: string[]): boolean {
+    let index = 0;
+    while (index < args.length) {
+        const arg = args[index]!;
+        if (isEnvAssignment(arg) || arg === "-i" || arg === "--ignore-environment") {
+            index++;
+            continue;
+        }
+        if (arg === "-u" || arg === "--unset" || arg === "-C" || arg === "--chdir") {
+            index += 2;
+            continue;
+        }
+        if (arg.startsWith("--unset=") || arg.startsWith("--chdir=")) {
+            index++;
+            continue;
+        }
+        break;
+    }
+    return index >= args.length || isReadOnlyCommandSegment(args.slice(index));
+}
+
+function isReadOnlyFindCommand(args: string[]): boolean {
+    return !args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf"].includes(arg));
+}
+
+function isReadOnlyGitCommand(args: string[]): boolean {
+    const parsed = parseGitSubcommand(args);
+    if (!parsed) return args.length === 0 || args.some((arg) => arg === "--version" || arg === "--help");
+    const { subcommand, subArgs } = parsed;
+    if (hasOption(subArgs, "-o", "--output")) return false;
+
+    if (["blame", "describe", "diff", "grep", "log", "ls-files", "ls-tree", "rev-list", "rev-parse", "shortlog", "show", "status", "version"].includes(subcommand)) return true;
+    if (subcommand === "branch") return isReadOnlyGitBranchCommand(subArgs);
+    if (subcommand === "remote") return subArgs.length === 0 || subArgs[0] === "-v" || ["get-url", "show"].includes(subArgs[0]!);
+    if (subcommand === "config") return isReadOnlyGitConfigCommand(subArgs);
+    if (subcommand === "stash") return subArgs[0] === "list" || subArgs[0] === "show";
+    return false;
+}
+
+function parseGitSubcommand(args: string[]): { subcommand: string; subArgs: string[] } | undefined {
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(arg)) {
+            i++;
+            continue;
+        }
+        if (arg.startsWith("-C") || arg.startsWith("-c") || arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=") || arg.startsWith("--namespace=")) continue;
+        if (arg === "--no-pager" || arg === "--paginate" || arg === "--version" || arg === "--help") continue;
+        if (arg.startsWith("-")) return undefined;
+        return { subcommand: arg, subArgs: args.slice(i + 1) };
+    }
+    return undefined;
+}
+
+function isReadOnlyGitBranchCommand(args: string[]): boolean {
+    return args.every((arg) => ["-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "--list", "--no-color"].includes(arg) || arg.startsWith("--format=") || arg.startsWith("--sort=") || arg.startsWith("--color="));
+}
+
+function isReadOnlyGitConfigCommand(args: string[]): boolean {
+    if (args.some((arg) => ["--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "add", "set", "unset", "rename-section", "remove-section"].includes(arg))) return false;
+    return args.some((arg) => ["--get", "--get-all", "--get-regexp", "--list", "--name-only", "get", "list"].includes(arg));
+}
+
+function isReadOnlyNpmCommand(args: string[]): boolean {
+    const command = args.find((arg) => !arg.startsWith("-"));
+    return !!command && ["info", "list", "ls", "outdated", "root", "view", "why"].includes(command);
+}
+
+function isVersionOrHelpFlag(arg: string): boolean {
+    return arg === "-v" || arg === "--version" || arg === "-h" || arg === "--help";
+}
+
+function hasOption(args: string[], short: string, long: string): boolean {
+    return args.some((arg) => arg === short || arg.startsWith(`${short}`) || arg === long || arg.startsWith(`${long}=`));
+}
+
+function isEnvAssignment(token: string | undefined): boolean {
+    return !!token && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token);
+}
+
 function isBashDenied(command: string): boolean {
     return effective.bash.denyPatterns.some((pattern) => new RegExp(pattern).test(command));
 }
@@ -627,8 +866,8 @@ function parseModeArg(args: string | undefined): PermissionMode | undefined {
 
 function formatModeChange(mode: PermissionMode): string {
     return mode === "auto"
-        ? "Permissions auto mode enabled: non-sensitive writes/edits, safe bash, and custom tools are auto-approved; dangerous bash still prompts/blocks."
-        : "Permissions ask mode enabled: bash/custom tools prompt unless allowlisted, and writes/edits require review.";
+        ? "Permissions auto mode enabled: non-sensitive writes/edits, non-dangerous bash (including read-only), and custom tools are auto-approved; dangerous bash still prompts/blocks."
+        : "Permissions ask mode enabled: read-only bash is auto-approved; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits require review.";
 }
 
 function updateStatus(ctx: { ui: ExtensionContext["ui"] }) {
