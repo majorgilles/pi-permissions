@@ -2,7 +2,7 @@
 
 Claude-Code-like permission gates for pi tool calls.
 
-This extension makes pi ask before running untrusted commands, blocks sensitive file access, and requires editor review before applying file writes or edits. It also has a Claude-Code-like auto mode for sessions where you want safe tool calls accepted automatically while dangerous commands still prompt or block.
+This extension lets read-only inspection run without prompts, blocks sensitive file access, and asks before mutating tool calls in the default `ask` mode. It also has a Claude-Code-like full auto mode for sessions where you want safe tool calls accepted automatically while dangerous commands still prompt or block.
 
 ## Install
 
@@ -48,8 +48,8 @@ permissions: auto
 
 ## Modes
 
-- `ask` (default): current permission-gate behavior. Bash/custom tools prompt unless allowlisted, and writes/edits open review editors.
-- `auto`: Claude-Code-like auto approval. Non-sensitive writes/edits, non-denied safe bash commands, and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
+- `ask` (default): manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits open review editors.
+- `auto`: Claude-Code-like full auto approval. Non-sensitive writes/edits, non-denied non-dangerous bash commands (including read-only bash), and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
 
 Toggle for the current session:
 
@@ -65,24 +65,24 @@ or:
 /permissions-mode ask
 ```
 
-You can make auto the default by setting top-level config field `"mode": "auto"`.
+Ask is the default. To default to full auto instead, set top-level config field `"mode": "auto"`.
 
 ## Default behavior
 
 | Tool | Ask mode | Auto mode |
 | --- | --- | --- |
 | `read` | Allowed unless the path matches `paths.denyRead` or `paths.sensitive`. | Same. |
-| `bash` | Allowed only when it matches exact/session/project/global allow rules; otherwise prompts. Dangerous commands still prompt/block. | Automatically allowed unless denied or dangerous. Dangerous commands still prompt/block. |
+| `bash` | Recognized read-only commands are allowed without prompting. Mutating or unknown commands prompt unless they match exact/session/project/global allow rules. Dangerous commands still prompt/block. | Automatically allowed unless denied or dangerous. Dangerous commands still prompt/block. |
 | `write` | Opens an editor with the full proposed content before executing. | Automatically allowed unless the path is denied/sensitive. |
 | `edit` | Opens an editor for each replacement before executing. | Automatically allowed unless the path is denied/sensitive. |
 | unknown/custom tools | Prompt by default, with limited persistence options. | Automatically allowed. |
 | no UI | Blocks anything that requires approval. | Auto-approved operations proceed; danger prompts still block because there is no UI. |
 
-Read-only built-ins `grep`, `find`, and `ls` are treated as known built-ins rather than unknown custom tools.
+Read-only built-ins `grep`, `find`, and `ls` are treated as known built-ins rather than unknown custom tools. Common read-only bash commands (`pwd`, `ls`, `cat`, `rg`, `grep`, `find`, `git status`, `git diff`, etc.) are also auto-allowed in every mode when they do not use output redirection or unsafe options such as `find -exec`/`-delete`.
 
 ## Bash approvals
 
-For an unallowed bash command, the prompt offers:
+For a bash command that requires approval, the prompt offers:
 
 - Deny
 - Allow once
@@ -154,21 +154,8 @@ Example:
   "version": 1,
   "mode": "ask",
   "bash": {
-    "allowExact": [
-      "pwd",
-      "ls",
-      "git status",
-      "git diff",
-      "git diff --stat"
-    ],
-    "allowPrefixes": [
-      "rg ",
-      "grep ",
-      "find . ",
-      "ls ",
-      "npm test",
-      "npm run test"
-    ],
+    "allowExact": [],
+    "allowPrefixes": [],
     "denyPatterns": []
   },
   "tools": {
@@ -202,9 +189,9 @@ Example:
 
 ### Config fields
 
-- `mode`: `"ask"` or `"auto"`; default startup mode. Session commands can override it until reload/restart.
-- `bash.allowExact`: exact commands allowed without prompting.
-- `bash.allowPrefixes`: command prefixes allowed without prompting.
+- `mode`: `"ask"` or `"auto"`; default startup mode (`"ask"` unless configured otherwise). Session commands can override it until reload/restart.
+- `bash.allowExact`: exact commands allowed without prompting. Usually only needed for commands you intentionally want to trust despite not being classified as read-only.
+- `bash.allowPrefixes`: command prefixes allowed without prompting. Prefer narrow prefixes because these bypass ask-mode prompts.
 - `bash.denyPatterns`: regular expressions checked against commands before allow rules.
 - `tools.allow`: custom tool names allowed without prompting.
 - `paths.denyRead`: path globs blocked for reads.
@@ -278,7 +265,7 @@ Note: `reviewEditor.vimMode` depends on whether the current pi version's `ctx.ui
 ## Limitations
 
 - This is a guardrail, not a sandbox. Extensions run with your user permissions.
-- Bash parsing is heuristic; shell syntax can hide side effects.
+- Bash parsing/read-only classification is heuristic; shell syntax can hide side effects, and unknown commands may still prompt in `ask` mode.
 - Path glob matching is intentionally simple.
 - The edit review UI is compact, not a full diff UI.
 - Non-interactive mode blocks approval-required actions rather than prompting.
