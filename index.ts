@@ -6,7 +6,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -34,15 +34,31 @@ type PermissionConfig = {
 		denyWrite?: string[];
 		sensitive?: string[];
 	};
-	reviewEditor?: {
-		vimMode?: boolean;
-	};
 	mainEditor?: {
 		vimMode?: boolean;
 	};
 };
 
-type EffectivePolicy = Required<PermissionConfig>;
+type EffectivePolicy = {
+	version: number;
+	mode: PermissionMode;
+	bash: {
+		allowExact: string[];
+		allowPrefixes: string[];
+		denyPatterns: string[];
+	};
+	tools: {
+		allow: string[];
+	};
+	paths: {
+		denyRead: string[];
+		denyWrite: string[];
+		sensitive: string[];
+	};
+	mainEditor: {
+		vimMode: boolean;
+	};
+};
 
 type SessionPolicy = {
 	bashExact: Set<string>;
@@ -52,7 +68,7 @@ type SessionPolicy = {
 
 const DEFAULT_CONFIG: PermissionConfig = {
     version: 1,
-    mode: "ask",
+    mode: "auto",
     bash: {
 		allowExact: [],
 		allowPrefixes: [],
@@ -78,7 +94,6 @@ const DEFAULT_CONFIG: PermissionConfig = {
 			"**/*.key",
 		],
 	},
-	reviewEditor: { vimMode: false },
 	mainEditor: { vimMode: false },
 };
 
@@ -105,10 +120,50 @@ const NORMAL_KEYS: Record<string, string | null> = {
 	a: null,
 };
 
-type ReviewHighlightMode = "write" | "edit";
+const DIFF_CONTEXT_LINES = 4;
+const DIFF_PREVIEW_VISIBLE_LINES = 18;
+const DIFF_CELL_THRESHOLD = 4_000_000;
+
+type DiffTool = "write" | "edit";
+type DiffLineKind = "added" | "removed" | "context" | "skip";
+type PermissionTheme = ExtensionContext["ui"]["theme"];
+type ApprovalChoice = "allow" | "deny";
+
+type TextEdit = { oldText: string; newText: string };
+
+type DiffLine = {
+	kind: DiffLineKind;
+	content: string;
+	oldLine?: number;
+	newLine?: number;
+	oldIndex?: number;
+	newIndex?: number;
+};
+
+type DiffPreview = {
+	tool: DiffTool;
+	path: string;
+	language?: string;
+	oldLines: string[];
+	newLines: string[];
+	lines: DiffLine[];
+	lineNumWidth: number;
+	added: number;
+	removed: number;
+	noChanges: boolean;
+	exact: boolean;
+};
 
 class VimEditor extends CustomEditor {
 	private mode: "normal" | "insert" = "insert";
+
+	constructor(
+		tui: ConstructorParameters<typeof CustomEditor>[0],
+		editorTheme: ConstructorParameters<typeof CustomEditor>[1],
+		keybindings: ConstructorParameters<typeof CustomEditor>[2],
+	) {
+		super(tui, editorTheme, keybindings);
+	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape")) {
@@ -153,153 +208,163 @@ class VimEditor extends CustomEditor {
 	}
 }
 
-class SyntaxReviewEditor extends CustomEditor {
-	private mode: "normal" | "insert" = "insert";
+class DiffApprovalComponent {
+	private selected: ApprovalChoice = "allow";
+	private scrollOffset = 0;
+	private highlightedOld: string[] | undefined;
+	private highlightedNew: string[] | undefined;
 
 	constructor(
-		tui: ConstructorParameters<typeof CustomEditor>[0],
-		editorTheme: ConstructorParameters<typeof CustomEditor>[1],
-		keybindings: ConstructorParameters<typeof CustomEditor>[2],
-		private readonly syntaxTheme: ExtensionContext["ui"]["theme"],
-		private readonly language: string | undefined,
-		private readonly highlightMode: ReviewHighlightMode,
-		private readonly vimModeEnabled: boolean,
-	) {
-		super(tui, editorTheme, keybindings);
-	}
+		private readonly preview: DiffPreview,
+		private readonly theme: PermissionTheme,
+		private readonly done: (approved: boolean) => void,
+	) {}
 
 	handleInput(data: string): void {
-		if (!this.vimModeEnabled) {
-			super.handleInput(data);
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+			this.done(false);
 			return;
 		}
-
-		if (matchesKey(data, "escape")) {
-			if (this.mode === "insert") {
-				this.mode = "normal";
-				return;
-			}
-			super.handleInput(data);
+		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+			this.done(this.selected === "allow");
 			return;
 		}
-
-		if (this.mode === "insert") {
-			super.handleInput(data);
+		if (matchesKey(data, Key.tab) || matchesKey(data, Key.space)) {
+			this.selected = this.selected === "allow" ? "deny" : "allow";
 			return;
 		}
-
-		if (data in NORMAL_KEYS) {
-			if (data === "i") this.mode = "insert";
-			else if (data === "a") {
-				this.mode = "insert";
-				super.handleInput("\x1b[C");
-			} else {
-				const seq = NORMAL_KEYS[data];
-				if (seq) super.handleInput(seq);
-			}
+		if (matchesKey(data, Key.left)) {
+			this.selected = "allow";
 			return;
 		}
-
-		if (data.length === 1 && data.charCodeAt(0) >= 32) return;
-		super.handleInput(data);
+		if (matchesKey(data, Key.right)) {
+			this.selected = "deny";
+			return;
+		}
+		if (matchesKey(data, Key.up) || data === "k") {
+			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+			return;
+		}
+		if (matchesKey(data, Key.down) || data === "j") {
+			this.scrollOffset += 1;
+			return;
+		}
+		if (matchesKey(data, Key.pageUp)) {
+			this.scrollOffset = Math.max(0, this.scrollOffset - DIFF_PREVIEW_VISIBLE_LINES);
+			return;
+		}
+		if (matchesKey(data, Key.pageDown)) {
+			this.scrollOffset += DIFF_PREVIEW_VISIBLE_LINES;
+			return;
+		}
+		if (data.length === 1) {
+			const normalized = data.toLowerCase();
+			if (normalized === "y" || normalized === "a") this.done(true);
+			else if (normalized === "n" || normalized === "d") this.done(false);
+		}
 	}
 
 	render(width: number): string[] {
-		const lines = super.render(width);
-		if (!this.language || lines.length <= 2) return this.renderVimLabel(lines, width);
-
-		const paddingX = this.getPaddingX?.() ?? 0;
-		const layout = buildReviewLayout(this.getLines(), width, paddingX);
-		const scrollOffset = (this as unknown as { scrollOffset?: number }).scrollOffset ?? 0;
-		const bodyLineCount = Math.max(0, lines.length - 2);
-		for (let i = 0; i < bodyLineCount; i++) {
-			const layoutLine = layout[scrollOffset + i];
-			if (!layoutLine) continue;
-			const styled = this.styleReviewLine(layoutLine.logicalLine, layoutLine.visualIndex, layoutLine.layoutWidth);
-			if (!styled || styled === layoutLine.text) continue;
-			const idx = lines[i + 1]!.indexOf(layoutLine.text);
-			if (idx >= 0) {
-				lines[i + 1] = `${lines[i + 1]!.slice(0, idx)}${styled}${lines[i + 1]!.slice(idx + layoutLine.text.length)}`;
-			}
+		const safeWidth = Math.max(1, width);
+		const body = this.renderBody(safeWidth);
+		const maxScroll = Math.max(0, body.length - DIFF_PREVIEW_VISIBLE_LINES);
+		this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
+		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES);
+		const lines = [
+			...this.renderHeader(safeWidth),
+			"",
+			...visibleBody,
+		];
+		if (body.length > DIFF_PREVIEW_VISIBLE_LINES) {
+			lines.push(
+				this.theme.fg(
+					"dim",
+					`Showing ${this.scrollOffset + 1}-${Math.min(this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES, body.length)} of ${body.length} diff lines`,
+				),
+			);
 		}
-		return this.renderVimLabel(lines, width);
+		lines.push("", this.renderButtons(safeWidth), this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"));
+		return lines.flatMap((line) => wrapTextWithAnsi(line, safeWidth));
 	}
 
-	private renderVimLabel(lines: string[], width: number): string[] {
-		if (!this.vimModeEnabled || lines.length === 0) return lines;
-		const label = this.mode === "normal" ? " NORMAL " : " INSERT ";
-		const last = lines.length - 1;
-		if (visibleWidth(lines[last]!) >= label.length) {
-			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
+	invalidate(): void {
+		this.highlightedOld = undefined;
+		this.highlightedNew = undefined;
+	}
+
+	private renderHeader(width: number): string[] {
+		const tool = this.preview.tool === "write" ? "write" : "edit";
+		const summary = this.preview.noChanges
+			? this.theme.fg("muted", "No textual changes detected")
+			: `${this.theme.fg("toolDiffAdded", `+${this.preview.added}`)} ${this.theme.fg("toolDiffRemoved", `-${this.preview.removed}`)}`;
+		const precision = this.preview.exact ? "" : this.theme.fg("warning", " (large diff shown as full replacement)");
+		return [
+			this.theme.fg("accent", this.theme.bold(`Approve ${tool} diff`)),
+			`${this.theme.fg("muted", "File:")} ${this.theme.fg("accent", this.preview.path)}`,
+			truncateToWidth(`${this.theme.fg("muted", "Changes:")} ${summary}${precision}`, width),
+			this.theme.fg("dim", "Read-only diff preview. The proposed output cannot be edited."),
+		];
+	}
+
+	private renderBody(width: number): string[] {
+		if (this.preview.noChanges) return [this.theme.fg("muted", "No diff hunks to display.")];
+		const rendered: string[] = [];
+		for (const line of this.preview.lines) {
+			rendered.push(...wrapTextWithAnsi(this.renderDiffLine(line), width));
 		}
-		return lines;
+		return rendered.length ? rendered : [this.theme.fg("muted", "No diff hunks to display.")];
 	}
 
-	private styleReviewLine(logicalLine: number, visualIndex: number, layoutWidth: number): string {
-		const highlighted = buildHighlightedReviewLines(this.getLines(), this.language!, this.highlightMode, this.syntaxTheme);
-		const styledLine = highlighted[logicalLine] ?? this.getLines()[logicalLine] ?? "";
-		return wrapTextWithAnsi(styledLine, layoutWidth)[visualIndex] ?? "";
-	}
-}
-
-type ReviewLayoutLine = { text: string; logicalLine: number; visualIndex: number; layoutWidth: number };
-
-function buildReviewLayout(lines: string[], width: number, paddingX: number): ReviewLayoutLine[] {
-	const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
-	const actualPaddingX = Math.min(paddingX, maxPadding);
-	const contentWidth = Math.max(1, width - actualPaddingX * 2);
-	const layoutWidth = Math.max(1, contentWidth - (actualPaddingX ? 0 : 1));
-	const layout: ReviewLayoutLine[] = [];
-	for (let logicalLine = 0; logicalLine < lines.length; logicalLine++) {
-		const chunks = wrapTextWithAnsi(lines[logicalLine] ?? "", layoutWidth);
-		for (let visualIndex = 0; visualIndex < chunks.length; visualIndex++) {
-			layout.push({ text: chunks[visualIndex] ?? "", logicalLine, visualIndex, layoutWidth });
+	private renderDiffLine(line: DiffLine): string {
+		if (line.kind === "skip") {
+			return this.theme.fg("toolDiffContext", ` ${"".padStart(this.preview.lineNumWidth)} ...`);
 		}
-	}
-	return layout.length ? layout : [{ text: "", logicalLine: 0, visualIndex: 0, layoutWidth }];
-}
-
-function buildHighlightedReviewLines(
-	lines: string[],
-	language: string,
-	highlightMode: ReviewHighlightMode,
-	theme: ExtensionContext["ui"]["theme"],
-): string[] {
-	if (highlightMode === "write") return alignHighlightedLines(lines, highlightCode(lines.join("\n"), language));
-
-	const result = [...lines];
-	const markerLine = findReplacementMarkerLine(lines);
-
-	const originalIndexes = lines
-		.map((line, index) => ({ line, index }))
-		.filter(({ line }) => line.startsWith("# | "))
-		.map(({ index }) => index);
-	const originalHighlighted = alignHighlightedLines(
-		originalIndexes.map((index) => lines[index]!.slice(4)),
-		highlightCode(originalIndexes.map((index) => lines[index]!.slice(4)).join("\n"), language),
-	);
-	originalIndexes.forEach((lineIndex, originalIndex) => {
-		result[lineIndex] = theme.fg("muted", "# | ") + (originalHighlighted[originalIndex] ?? lines[lineIndex]!.slice(4));
-	});
-
-	for (let i = 0; i < lines.length; i++) {
-		if (lines[i]!.startsWith("# | ")) continue;
-		if (lines[i]!.startsWith("#")) result[i] = theme.fg("muted", lines[i]!);
-		else if (lines[i] === "--- replacement ---") result[i] = theme.fg("accent", lines[i]!);
+		const sign = line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " ";
+		const lineNumber = line.kind === "added" ? line.newLine : line.oldLine;
+		const prefix = `${sign}${String(lineNumber ?? "").padStart(this.preview.lineNumWidth, " ")} `;
+		const color = line.kind === "added" ? "toolDiffAdded" : line.kind === "removed" ? "toolDiffRemoved" : "toolDiffContext";
+		const content = this.renderDiffContent(line);
+		if (this.preview.language) return this.theme.fg(color, prefix) + content;
+		return this.theme.fg(color, prefix + content);
 	}
 
-	if (markerLine >= 0) {
-		const replacementIndexes = lines.map((_, index) => index).filter((index) => index > markerLine);
-		const replacementHighlighted = alignHighlightedLines(
-			replacementIndexes.map((index) => lines[index]!),
-			highlightCode(replacementIndexes.map((index) => lines[index]!).join("\n"), language),
-		);
-		replacementIndexes.forEach((lineIndex, replacementIndex) => {
-			result[lineIndex] = replacementHighlighted[replacementIndex] ?? lines[lineIndex]!;
-		});
+	private renderDiffContent(line: DiffLine): string {
+		if (line.kind === "added" && line.newIndex !== undefined) {
+			return this.getHighlightedNew()[line.newIndex] ?? replaceTabs(line.content);
+		}
+		if (line.kind === "removed" && line.oldIndex !== undefined) {
+			return this.getHighlightedOld()[line.oldIndex] ?? replaceTabs(line.content);
+		}
+		if (line.kind === "context" && line.newIndex !== undefined) {
+			return this.getHighlightedNew()[line.newIndex] ?? replaceTabs(line.content);
+		}
+		return replaceTabs(line.content);
 	}
 
-	return result;
+	private getHighlightedOld(): string[] {
+		this.highlightedOld ??= highlightDiffSourceLines(this.preview.oldLines, this.preview.language);
+		return this.highlightedOld;
+	}
+
+	private getHighlightedNew(): string[] {
+		this.highlightedNew ??= highlightDiffSourceLines(this.preview.newLines, this.preview.language);
+		return this.highlightedNew;
+	}
+
+	private renderButtons(width: number): string {
+		const allow = this.renderButton("allow", "Allow");
+		const deny = this.renderButton("deny", "Deny");
+		return truncateToWidth(`${allow} ${deny}`, width);
+	}
+
+	private renderButton(choice: ApprovalChoice, label: string): string {
+		const base = ` ${label} `;
+		if (this.selected !== choice) {
+			return choice === "allow" ? this.theme.fg("success", base) : this.theme.fg("error", base);
+		}
+		const colored = choice === "allow" ? this.theme.fg("success", this.theme.bold(base)) : this.theme.fg("error", this.theme.bold(base));
+		return this.theme.bg("selectedBg", colored);
+	}
 }
 
 function alignHighlightedLines(sourceLines: string[], highlightedLines: string[]): string[] {
@@ -307,8 +372,329 @@ function alignHighlightedLines(sourceLines: string[], highlightedLines: string[]
 	return sourceLines.map((line, index) => highlightedLines[index] ?? line);
 }
 
-function findReplacementMarkerLine(lines: string[]): number {
-	return lines.findIndex((line) => line === "--- replacement ---");
+function highlightDiffSourceLines(sourceLines: string[], language: string | undefined): string[] {
+	const displayLines = sourceLines.map(replaceTabs);
+	if (!language || displayLines.length === 0) return displayLines;
+	return alignHighlightedLines(displayLines, highlightCode(displayLines.join("\n"), language));
+}
+
+function replaceTabs(text: string): string {
+	return text.replace(/\t/g, "   ");
+}
+
+async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
+	return await ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
+		const component = new DiffApprovalComponent(preview, theme, done);
+		return {
+			render: (width: number) => component.render(width),
+			invalidate: () => component.invalidate(),
+			handleInput: (data: string) => {
+				component.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
+}
+
+function buildWriteDiffPreview(input: { path: string; content: string }, cwd: string): DiffPreview {
+	const absolutePath = resolveForPolicy(input.path, cwd);
+	const previousContent = readTextFileIfExists(absolutePath);
+	return buildDiffPreview("write", input.path, previousContent, input.content);
+}
+
+function buildEditDiffPreview(input: { path: string; edits: TextEdit[] }, cwd: string): DiffPreview {
+	const absolutePath = resolveForPolicy(input.path, cwd);
+	const rawContent = fs.readFileSync(absolutePath, "utf8");
+	const { text: content } = stripBom(rawContent);
+	const normalizedContent = normalizeToLF(content);
+	const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, input.edits, input.path);
+	return buildDiffPreview("edit", input.path, baseContent, newContent);
+}
+
+function buildDiffPreview(tool: DiffTool, filePath: string, oldContent: string, newContent: string): DiffPreview {
+	const oldNormalized = normalizeToLF(oldContent);
+	const newNormalized = normalizeToLF(newContent);
+	const oldLines = splitLinesForDiff(oldNormalized);
+	const newLines = splitLinesForDiff(newNormalized);
+	const noChanges = oldNormalized === newNormalized;
+	const { lines, exact } = noChanges
+		? { lines: [] as DiffLine[], exact: true }
+		: buildStructuredDiff(oldLines, newLines, DIFF_CONTEXT_LINES);
+	const maxLineNum = Math.max(oldLines.length, newLines.length, 1);
+	return {
+		tool,
+		path: filePath,
+		language: getLanguageFromPath(filePath),
+		oldLines,
+		newLines,
+		lines,
+		lineNumWidth: String(maxLineNum).length,
+		added: lines.filter((line) => line.kind === "added").length,
+		removed: lines.filter((line) => line.kind === "removed").length,
+		noChanges,
+		exact,
+	};
+}
+
+function readTextFileIfExists(absolutePath: string): string {
+	try {
+		return fs.readFileSync(absolutePath, "utf8");
+	} catch (error) {
+		if (getErrorCode(error) === "ENOENT") return "";
+		throw error;
+	}
+}
+
+function splitLinesForDiff(content: string): string[] {
+	const lines = content.split("\n");
+	if (lines[lines.length - 1] === "") lines.pop();
+	return lines;
+}
+
+type RawDiffOp = {
+	type: "equal" | "added" | "removed";
+	content: string;
+	oldIndex?: number;
+	newIndex?: number;
+};
+
+type DiffSegment = {
+	type: RawDiffOp["type"];
+	lines: RawDiffOp[];
+};
+
+function buildStructuredDiff(oldLines: string[], newLines: string[], contextLines: number): { lines: DiffLine[]; exact: boolean } {
+	const rawOps = oldLines.length * newLines.length > DIFF_CELL_THRESHOLD
+		? buildFullReplacementOps(oldLines, newLines)
+		: buildLcsDiffOps(oldLines, newLines);
+	const segments = groupDiffOps(rawOps);
+	const result: DiffLine[] = [];
+	let oldLineNum = 1;
+	let newLineNum = 1;
+
+	for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+		const segment = segments[segmentIndex]!;
+		if (segment.type === "removed") {
+			for (const op of segment.lines) {
+				result.push({ kind: "removed", content: op.content, oldLine: oldLineNum, oldIndex: op.oldIndex });
+				oldLineNum++;
+			}
+			continue;
+		}
+		if (segment.type === "added") {
+			for (const op of segment.lines) {
+				result.push({ kind: "added", content: op.content, newLine: newLineNum, newIndex: op.newIndex });
+				newLineNum++;
+			}
+			continue;
+		}
+
+		const hasLeadingChange = segmentIndex > 0 && segments[segmentIndex - 1]!.type !== "equal";
+		const hasTrailingChange = segmentIndex < segments.length - 1 && segments[segmentIndex + 1]!.type !== "equal";
+		const segmentOldStart = oldLineNum;
+		const segmentNewStart = newLineNum;
+		const length = segment.lines.length;
+		const addContextRange = (start: number, end: number) => {
+			for (let offset = start; offset < end; offset++) {
+				const op = segment.lines[offset]!;
+				result.push({
+					kind: "context",
+					content: op.content,
+					oldLine: segmentOldStart + offset,
+					newLine: segmentNewStart + offset,
+					oldIndex: op.oldIndex,
+					newIndex: op.newIndex,
+				});
+			}
+		};
+		const addSkip = () => result.push({ kind: "skip", content: "..." });
+
+		if (hasLeadingChange && hasTrailingChange) {
+			if (length <= contextLines * 2) {
+				addContextRange(0, length);
+			} else {
+				addContextRange(0, contextLines);
+				addSkip();
+				addContextRange(length - contextLines, length);
+			}
+		} else if (hasLeadingChange) {
+			addContextRange(0, Math.min(contextLines, length));
+			if (length > contextLines) addSkip();
+		} else if (hasTrailingChange) {
+			if (length > contextLines) addSkip();
+			addContextRange(Math.max(0, length - contextLines), length);
+		}
+
+		oldLineNum += length;
+		newLineNum += length;
+	}
+
+	return { lines: result, exact: rawOps.length === 0 || oldLines.length * newLines.length <= DIFF_CELL_THRESHOLD };
+}
+
+function buildLcsDiffOps(oldLines: string[], newLines: string[]): RawDiffOp[] {
+	const dp = Array.from({ length: oldLines.length + 1 }, () => new Uint32Array(newLines.length + 1));
+	for (let i = oldLines.length - 1; i >= 0; i--) {
+		for (let j = newLines.length - 1; j >= 0; j--) {
+			dp[i]![j] = oldLines[i] === newLines[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
+		}
+	}
+
+	const ops: RawDiffOp[] = [];
+	let i = 0;
+	let j = 0;
+	while (i < oldLines.length || j < newLines.length) {
+		if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+			ops.push({ type: "equal", content: oldLines[i]!, oldIndex: i, newIndex: j });
+			i++;
+			j++;
+		} else if (j < newLines.length && (i >= oldLines.length || dp[i]![j + 1]! > dp[i + 1]![j]!)) {
+			ops.push({ type: "added", content: newLines[j]!, newIndex: j });
+			j++;
+		} else if (i < oldLines.length) {
+			ops.push({ type: "removed", content: oldLines[i]!, oldIndex: i });
+			i++;
+		}
+	}
+	return ops;
+}
+
+function buildFullReplacementOps(oldLines: string[], newLines: string[]): RawDiffOp[] {
+	return [
+		...oldLines.map((content, oldIndex) => ({ type: "removed" as const, content, oldIndex })),
+		...newLines.map((content, newIndex) => ({ type: "added" as const, content, newIndex })),
+	];
+}
+
+function groupDiffOps(ops: RawDiffOp[]): DiffSegment[] {
+	const segments: DiffSegment[] = [];
+	for (const op of ops) {
+		const last = segments[segments.length - 1];
+		if (last && last.type === op.type) last.lines.push(op);
+		else segments.push({ type: op.type, lines: [op] });
+	}
+	return segments;
+}
+
+function normalizeToLF(text: string): string {
+	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function normalizeForFuzzyMatch(text: string): string {
+	return text
+		.normalize("NFKC")
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n")
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+}
+
+function stripBom(content: string): { bom: string; text: string } {
+	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
+}
+
+function fuzzyFindText(content: string, oldText: string): {
+	found: boolean;
+	index: number;
+	matchLength: number;
+	usedFuzzyMatch: boolean;
+	contentForReplacement: string;
+} {
+	const exactIndex = content.indexOf(oldText);
+	if (exactIndex !== -1) {
+		return { found: true, index: exactIndex, matchLength: oldText.length, usedFuzzyMatch: false, contentForReplacement: content };
+	}
+
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
+	if (fuzzyIndex === -1) {
+		return { found: false, index: -1, matchLength: 0, usedFuzzyMatch: false, contentForReplacement: content };
+	}
+
+	return {
+		found: true,
+		index: fuzzyIndex,
+		matchLength: fuzzyOldText.length,
+		usedFuzzyMatch: true,
+		contentForReplacement: fuzzyContent,
+	};
+}
+
+function countOccurrences(content: string, oldText: string): number {
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	return fuzzyContent.split(fuzzyOldText).length - 1;
+}
+
+function applyEditsToNormalizedContent(normalizedContent: string, edits: TextEdit[], filePath: string): { baseContent: string; newContent: string } {
+	const normalizedEdits = edits.map((edit) => ({ oldText: normalizeToLF(edit.oldText), newText: normalizeToLF(edit.newText) }));
+	for (let i = 0; i < normalizedEdits.length; i++) {
+		if (normalizedEdits[i]!.oldText.length === 0) throw new Error(formatEmptyOldTextError(filePath, i, normalizedEdits.length));
+	}
+
+	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
+	const baseContent = initialMatches.some((match) => match.usedFuzzyMatch) ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+	const matchedEdits: Array<{ editIndex: number; matchIndex: number; matchLength: number; newText: string }> = [];
+
+	for (let i = 0; i < normalizedEdits.length; i++) {
+		const edit = normalizedEdits[i]!;
+		const matchResult = fuzzyFindText(baseContent, edit.oldText);
+		if (!matchResult.found) throw new Error(formatNotFoundError(filePath, i, normalizedEdits.length));
+		const occurrences = countOccurrences(baseContent, edit.oldText);
+		if (occurrences > 1) throw new Error(formatDuplicateError(filePath, i, normalizedEdits.length, occurrences));
+		matchedEdits.push({ editIndex: i, matchIndex: matchResult.index, matchLength: matchResult.matchLength, newText: edit.newText });
+	}
+
+	matchedEdits.sort((a, b) => a.matchIndex - b.matchIndex);
+	for (let i = 1; i < matchedEdits.length; i++) {
+		const previous = matchedEdits[i - 1]!;
+		const current = matchedEdits[i]!;
+		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
+			throw new Error(`edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in ${filePath}. Merge them into one edit or target disjoint regions.`);
+		}
+	}
+
+	let newContent = baseContent;
+	for (let i = matchedEdits.length - 1; i >= 0; i--) {
+		const edit = matchedEdits[i]!;
+		newContent = newContent.substring(0, edit.matchIndex) + edit.newText + newContent.substring(edit.matchIndex + edit.matchLength);
+	}
+	if (baseContent === newContent) throw new Error(formatNoChangeError(filePath, normalizedEdits.length));
+	return { baseContent, newContent };
+}
+
+function formatNotFoundError(filePath: string, editIndex: number, totalEdits: number): string {
+	return totalEdits === 1
+		? `Could not find the exact text in ${filePath}. The old text must match exactly including all whitespace and newlines.`
+		: `Could not find edits[${editIndex}] in ${filePath}. The oldText must match exactly including all whitespace and newlines.`;
+}
+
+function formatDuplicateError(filePath: string, editIndex: number, totalEdits: number, occurrences: number): string {
+	return totalEdits === 1
+		? `Found ${occurrences} occurrences of the text in ${filePath}. The text must be unique. Please provide more context to make it unique.`
+		: `Found ${occurrences} occurrences of edits[${editIndex}] in ${filePath}. Each oldText must be unique. Please provide more context to make it unique.`;
+}
+
+function formatEmptyOldTextError(filePath: string, editIndex: number, totalEdits: number): string {
+	return totalEdits === 1 ? `oldText must not be empty in ${filePath}.` : `edits[${editIndex}].oldText must not be empty in ${filePath}.`;
+}
+
+function formatNoChangeError(filePath: string, totalEdits: number): string {
+	return totalEdits === 1
+		? `No changes made to ${filePath}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.`
+		: `No changes made to ${filePath}. The replacements produced identical content.`;
+}
+
+function getErrorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
+}
+
+function formatError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 export default function permissionsExtension(pi: ExtensionAPI) {
@@ -362,7 +748,7 @@ export default function permissionsExtension(pi: ExtensionAPI) {
             }
             sessionModeOverride = requested;
             updateStatus(ctx);
-            ctx.ui.notify(formatModeChange(requested), "success");
+            ctx.ui.notify(formatModeChange(requested), "info");
         },
     });
 
@@ -380,7 +766,7 @@ export default function permissionsExtension(pi: ExtensionAPI) {
             }
             sessionModeOverride = nextMode;
             updateStatus(ctx);
-            ctx.ui.notify(formatModeChange(nextMode), "success");
+            ctx.ui.notify(formatModeChange(nextMode), "info");
         },
     });
 
@@ -389,7 +775,7 @@ export default function permissionsExtension(pi: ExtensionAPI) {
         handler: async (_args, ctx) => {
             reloadPolicy(ctx.cwd);
             updateStatus(ctx);
-            ctx.ui.notify("Permissions reloaded", "success");
+            ctx.ui.notify("Permissions reloaded", "info");
         },
     });
 
@@ -416,7 +802,7 @@ export default function permissionsExtension(pi: ExtensionAPI) {
 				fs.writeFileSync(file, edited.endsWith("\n") ? edited : `${edited}\n`, "utf8");
 				reloadPolicy(ctx.cwd);
 				updateStatus(ctx);
-				ctx.ui.notify(`Saved ${scope} permissions`, "success");
+				ctx.ui.notify(`Saved ${scope} permissions`, "info");
 			} catch (error) {
 				ctx.ui.notify(`Invalid JSON; not saved: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
@@ -480,10 +866,17 @@ async function handleWrite(input: { path: string; content: string }, ctx: Extens
         return { block: true, reason: `Write blocked by permissions policy: ${input.path}` };
     }
     if (currentMode() === "auto") return;
-    if (!ctx.hasUI) return { block: true, reason: `Write requires editor review: ${input.path}` };
-    const edited = await withReviewEditor(ctx, input.path, "write", () => ctx.ui.editor(`Review write: ${input.path}`, input.content));
-	if (edited === undefined) return { block: true, reason: `Write review cancelled: ${input.path}` };
-	input.content = edited;
+    if (!ctx.hasUI) return { block: true, reason: `Write requires diff approval: ${input.path}` };
+
+	let preview: DiffPreview;
+	try {
+		preview = buildWriteDiffPreview(input, ctx.cwd);
+	} catch (error) {
+		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
+	}
+
+	const approved = await requestDiffApproval(ctx, preview);
+	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
 }
 
 async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
@@ -491,23 +884,17 @@ async function handleEdit(input: { path: string; edits: Array<{ oldText: string;
         return { block: true, reason: `Edit blocked by permissions policy: ${input.path}` };
     }
     if (currentMode() === "auto") return;
-    if (!ctx.hasUI) return { block: true, reason: `Edit requires editor review: ${input.path}` };
+    if (!ctx.hasUI) return { block: true, reason: `Edit requires diff approval: ${input.path}` };
 
-    for (let i = 0; i < input.edits.length; i++) {
-		const edit = input.edits[i]!;
-		const buffer = [
-			`# Review edit ${i + 1}/${input.edits.length}: ${input.path}`,
-			"# Lines starting with # are ignored.",
-			"# Original block:",
-			...edit.oldText.split("\n").map((line) => `# | ${line}`),
-			"# Replacement block starts below. Edit it, then accept/save.",
-			"--- replacement ---",
-			edit.newText,
-		].join("\n");
-		const reviewed = await withReviewEditor(ctx, input.path, "edit", () => ctx.ui.editor(`Review edit: ${input.path}`, buffer));
-		if (reviewed === undefined) return { block: true, reason: `Edit review cancelled: ${input.path}` };
-		edit.newText = extractReplacement(reviewed);
+	let preview: DiffPreview;
+	try {
+		preview = buildEditDiffPreview(input, ctx.cwd);
+	} catch (error) {
+		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
 	}
+
+	const approved = await requestDiffApproval(ctx, preview);
+	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
 }
 
 async function handleUnknownTool(toolName: string, ctx: ExtensionContext) {
@@ -529,30 +916,6 @@ async function handleUnknownTool(toolName: string, ctx: ExtensionContext) {
 	} else if (choice === "Allow this tool by name globally") {
 		sessionPolicy.tools.add(toolName);
 		addGlobalRule((cfg) => addUnique(cfg.tools!, "allow", toolName));
-	}
-}
-
-async function withReviewEditor<T>(
-	ctx: ExtensionContext,
-	filePath: string,
-	highlightMode: ReviewHighlightMode,
-	fn: () => Promise<T>,
-): Promise<T> {
-	// `ctx.ui.editor` may or may not use the app editor factory depending on pi version.
-	// This enables syntax highlighting and optional vim mode where supported and leaves
-	// default behavior otherwise.
-	const language = getLanguageFromPath(filePath);
-	if (!language && !effective.reviewEditor.vimMode) return fn();
-	const previous = ctx.ui.getEditorComponent?.();
-	ctx.ui.setEditorComponent?.((tui, theme, kb) =>
-		language
-			? new SyntaxReviewEditor(tui, theme, kb, ctx.ui.theme, language, highlightMode, effective.reviewEditor.vimMode)
-			: new VimEditor(tui, theme, kb),
-	);
-	try {
-		return await fn();
-	} finally {
-		ctx.ui.setEditorComponent?.(previous);
 	}
 }
 
@@ -580,11 +943,10 @@ function ensureConfigFile(file: string) {
 function mergeConfigs(...configs: PermissionConfig[]): EffectivePolicy {
     const merged: EffectivePolicy = {
         version: 1,
-        mode: "ask",
+        mode: "auto",
         bash: { allowExact: [], allowPrefixes: [], denyPatterns: [] },
 		tools: { allow: [] },
 		paths: { denyRead: [], denyWrite: [], sensitive: [] },
-		reviewEditor: { vimMode: false },
 		mainEditor: { vimMode: false },
 	};
     for (const cfg of configs) {
@@ -597,7 +959,6 @@ function mergeConfigs(...configs: PermissionConfig[]): EffectivePolicy {
 		pushAll(merged.paths.denyRead, cfg.paths?.denyRead);
 		pushAll(merged.paths.denyWrite, cfg.paths?.denyWrite);
 		pushAll(merged.paths.sensitive, cfg.paths?.sensitive);
-		merged.reviewEditor.vimMode = cfg.reviewEditor?.vimMode ?? merged.reviewEditor.vimMode;
 		merged.mainEditor.vimMode = cfg.mainEditor?.vimMode ?? merged.mainEditor.vimMode;
 	}
 	return merged;
@@ -867,7 +1228,7 @@ function parseModeArg(args: string | undefined): PermissionMode | undefined {
 function formatModeChange(mode: PermissionMode): string {
     return mode === "auto"
         ? "Permissions auto mode enabled: non-sensitive writes/edits, non-dangerous bash (including read-only), and custom tools are auto-approved; dangerous bash still prompts/blocks."
-        : "Permissions ask mode enabled: read-only bash is auto-approved; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits require review.";
+        : "Permissions ask mode enabled: read-only bash is auto-approved; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits require read-only diff approval.";
 }
 
 function updateStatus(ctx: { ui: ExtensionContext["ui"] }) {
@@ -909,7 +1270,7 @@ function addGlobalRule(mutate: (cfg: PermissionConfig) => void) {
 function mergeConfigForWrite(cfg: PermissionConfig): PermissionConfig {
     return {
         version: cfg.version ?? 1,
-        mode: cfg.mode ?? "ask",
+        mode: cfg.mode ?? "auto",
         bash: {
 			allowExact: cfg.bash?.allowExact ?? [],
 			allowPrefixes: cfg.bash?.allowPrefixes ?? [],
@@ -921,7 +1282,6 @@ function mergeConfigForWrite(cfg: PermissionConfig): PermissionConfig {
 			denyWrite: cfg.paths?.denyWrite ?? [],
 			sensitive: cfg.paths?.sensitive ?? [],
 		},
-		reviewEditor: { vimMode: cfg.reviewEditor?.vimMode ?? false },
 		mainEditor: { vimMode: cfg.mainEditor?.vimMode ?? false },
 	};
 }
@@ -954,13 +1314,6 @@ function globMatch(value: string, glob: string): boolean {
 	return new RegExp(`^${escaped}$`).test(value);
 }
 
-function extractReplacement(buffer: string): string {
-	const marker = "--- replacement ---";
-	const idx = buffer.indexOf(marker);
-	if (idx < 0) return buffer.split("\n").filter((line) => !line.startsWith("#")).join("\n");
-	return buffer.slice(idx + marker.length).replace(/^\r?\n/, "");
-}
-
 function suggestPrefix(command: string): string {
 	const parts = command.trim().split(/\s+/);
 	if (parts[0] === "git" && parts[1]) return `git ${parts[1]}`;
@@ -978,7 +1331,6 @@ function formatSummary(cwd: string): string {
 		`Bash prefixes: ${effective.bash.allowPrefixes.length} global/project, ${sessionPolicy.bashPrefixes.size} session`,
 		`Allowed custom tools: ${effective.tools.allow.length} global/project, ${sessionPolicy.tools.size} session`,
 		`Sensitive path patterns: ${effective.paths.sensitive.length}`,
-		`Review editor vim: ${effective.reviewEditor.vimMode ? "on" : "off"}`,
 		`Main editor vim: ${effective.mainEditor.vimMode ? "on" : "off"}`,
 	].join("\n");
 }
