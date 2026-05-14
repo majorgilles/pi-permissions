@@ -1,6 +1,6 @@
 {
   "name": "@majorgilles/pi-permissions",
-  "version": "0.1.3",
+  "version": "0.2.2",
   "description": "Claude-Code-like permission gates for pi tool calls.",
   "type": "module",
   "keywords": [
