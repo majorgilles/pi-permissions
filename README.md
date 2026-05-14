@@ -48,7 +48,7 @@ permissions: auto
 
 ## Modes
 
-- `ask` (default): manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits open review editors.
+- `ask` (default): manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits show a read-only Claude-Code-style diff approval UI.
 - `auto`: Claude-Code-like full auto approval. Non-sensitive writes/edits, non-denied non-dangerous bash commands (including read-only bash), and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
 
 Toggle for the current session:
@@ -73,8 +73,8 @@ Ask is the default. To default to full auto instead, set top-level config field 
 | --- | --- | --- |
 | `read` | Allowed unless the path matches `paths.denyRead` or `paths.sensitive`. | Same. |
 | `bash` | Recognized read-only commands are allowed without prompting. Mutating or unknown commands prompt unless they match exact/session/project/global allow rules. Dangerous commands still prompt/block. | Automatically allowed unless denied or dangerous. Dangerous commands still prompt/block. |
-| `write` | Opens an editor with the full proposed content before executing. | Automatically allowed unless the path is denied/sensitive. |
-| `edit` | Opens an editor for each replacement before executing. | Automatically allowed unless the path is denied/sensitive. |
+| `write` | Shows a read-only diff between the current file and proposed content, then asks Allow/Deny. | Automatically allowed unless the path is denied/sensitive. |
+| `edit` | Shows a read-only diff of the proposed replacements, then asks Allow/Deny. | Automatically allowed unless the path is denied/sensitive. |
 | unknown/custom tools | Prompt by default, with limited persistence options. | Automatically allowed. |
 | no UI | Blocks anything that requires approval. | Auto-approved operations proceed; danger prompts still block because there is no UI. |
 
@@ -112,26 +112,13 @@ It requires extra confirmation for risky patterns such as:
 
 These checks are heuristic and should not be treated as a complete sandbox.
 
-## Write/edit review
+## Write/edit diff approvals
 
-Review editors use syntax highlighting for recognized source-code file types. For `write`, the proposed file content is highlighted using the target file extension. For `edit`, the original commented block and replacement block are highlighted; only the replacement block remains editable/applicable as before.
+In `ask` mode, `write` and `edit` no longer open editable review buffers. Instead they show a read-only Claude-Code-style diff with colored additions/removals and syntax highlighting for recognized source-code file types.
 
-### `write`
+Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, Enter to confirm, and Esc to deny. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
 
-The review editor contains the full proposed file contents. The accepted editor contents become the final `write.content`.
-
-### `edit`
-
-Each replacement is reviewed separately. The buffer includes commented instructions and original text, followed by:
-
-```text
---- replacement ---
-<proposed replacement>
-```
-
-Only the text after `--- replacement ---` is applied as `newText`.
-
-In `ask` mode, `write` and `edit` are always reviewed. In `auto` mode, they are accepted automatically unless the target path matches `paths.denyWrite` or `paths.sensitive`.
+In `auto` mode, `write` and `edit` are accepted automatically unless the target path matches `paths.denyWrite` or `paths.sensitive`.
 
 ## Config
 
@@ -178,9 +165,6 @@ Example:
       "**/*.key"
     ]
   },
-  "reviewEditor": {
-    "vimMode": false
-  },
   "mainEditor": {
     "vimMode": false
   }
@@ -197,7 +181,6 @@ Example:
 - `paths.denyRead`: path globs blocked for reads.
 - `paths.denyWrite`: path globs blocked for writes/edits.
 - `paths.sensitive`: path globs blocked for both reads and writes/edits.
-- `reviewEditor.vimMode`: temporarily enable vim-style editor bindings for review editors where supported. Review editors also syntax-highlight recognized code files where the current pi version honors custom editor components.
 - `mainEditor.vimMode`: replace pi's main input editor with a simple vim-style modal editor.
 
 ## Admin commands
@@ -242,11 +225,10 @@ Reload global and project configs without restarting pi.
 
 Vim bindings are off by default.
 
-Set either value to `true` in config:
+Set `mainEditor.vimMode` to `true` in config:
 
 ```json
 {
-  "reviewEditor": { "vimMode": true },
   "mainEditor": { "vimMode": true }
 }
 ```
@@ -260,19 +242,25 @@ Implemented normal-mode keys include:
 - `0`, `$`: line start/end
 - `x`: delete character
 
-Note: `reviewEditor.vimMode` depends on whether the current pi version's `ctx.ui.editor` honors the editor component factory. If not, main editor vim mode still works when enabled.
+Write/edit diff approval is read-only and does not use vim mode.
 
 ## Limitations
 
 - This is a guardrail, not a sandbox. Extensions run with your user permissions.
 - Bash parsing/read-only classification is heuristic; shell syntax can hide side effects, and unknown commands may still prompt in `ask` mode.
 - Path glob matching is intentionally simple.
-- The edit review UI is compact, not a full diff UI.
+- Write/edit diff approval is line-based; very large diffs may be shown as a full replacement preview.
 - Non-interactive mode blocks approval-required actions rather than prompting.
 
-## Updating
+## Checking
 
-After changing the extension code or config, run:
+Validate package contents with:
+
+```bash
+npm pack --dry-run
+```
+
+After changing the extension code or config, reload pi with:
 
 ```text
 /reload
