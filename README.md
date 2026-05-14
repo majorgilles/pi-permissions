@@ -285,3 +285,7 @@ or use:
 ```
 
 for config-only changes.
+
+## License
+
+This source is available under the [PolyForm Noncommercial License 1.0.0](./LICENSE). You may download, copy, modify, and share it for noncommercial purposes. Commercial use is not permitted without separate written permission.
