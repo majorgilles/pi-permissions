@@ -262,8 +262,14 @@ class DiffApprovalComponent {
 		const prefix = `${sign}${String(lineNumber ?? "").padStart(this.preview.lineNumWidth, " ")} `;
 		const color = line.kind === "added" ? "toolDiffAdded" : line.kind === "removed" ? "toolDiffRemoved" : "toolDiffContext";
 		const content = this.renderDiffContent(line);
-		if (this.preview.language) return this.theme.fg(color, prefix) + content;
-		return this.theme.fg(color, prefix + content);
+		const styled = this.preview.language ? this.theme.fg(color, prefix) + content : this.theme.fg(color, prefix + content);
+		return this.highlightDiffLineBackground(line.kind, styled);
+	}
+
+	private highlightDiffLineBackground(kind: DiffLineKind, text: string): string {
+		if (kind === "added") return this.theme.bg("toolSuccessBg", text);
+		if (kind === "removed") return this.theme.bg("toolErrorBg", text);
+		return text;
 	}
 
 	private renderDiffContent(line: DiffLine): string {

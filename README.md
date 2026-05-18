@@ -104,7 +104,7 @@ These checks are heuristic and should not be treated as a complete sandbox.
 
 ## Write/edit diff approvals
 
-In `ask` mode, `write` and `edit` show a read-only Claude-Code-style diff with colored additions/removals and syntax highlighting for recognized source-code file types.
+In `ask` mode, `write` and `edit` show a read-only Claude-Code-style diff with transparent-style red backgrounds for deletions, transparent-style green backgrounds for additions, and syntax highlighting for recognized source-code file types.
 
 Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, Enter to confirm, and Esc to deny. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
 
@@ -233,3 +233,7 @@ or use:
 ```
 
 for preference-only changes.
+
+## License
+
+This source is available under the [PolyForm Noncommercial License 1.0.0](./LICENSE). You may download, copy, modify, and share it for noncommercial purposes. Commercial use is not permitted without separate written permission.
