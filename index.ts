@@ -14,120 +14,31 @@ import path from "node:path";
 const GLOBAL_CONFIG = path.join(os.homedir(), ".pi", "agent", "permissions.json");
 const PROJECT_CONFIG = ".pi/permissions.json";
 
-const BUILTIN_TOOLS = new Set(["read", "bash", "write", "edit", "grep", "find", "ls"]);
+const DIFF_CONTEXT_LINES = 4;
+const DIFF_PREVIEW_VISIBLE_LINES = 18;
+const DIFF_CELL_THRESHOLD = 4_000_000;
 
 type PermissionMode = "ask" | "auto";
+type DiffTool = "write" | "edit";
+type DiffLineKind = "added" | "removed" | "context" | "skip";
+type PermissionTheme = ExtensionContext["ui"]["theme"];
+type ApprovalChoice = "allow" | "deny";
 
 type PermissionConfig = {
-    version?: number;
-    mode?: PermissionMode;
-    bash?: {
-		allowExact?: string[];
-		allowPrefixes?: string[];
-		denyPatterns?: string[];
-	};
-	tools?: {
-		allow?: string[];
-	};
-	paths?: {
-		denyRead?: string[];
-		denyWrite?: string[];
-		sensitive?: string[];
-	};
+	version?: number;
+	mode?: PermissionMode;
 	mainEditor?: {
 		vimMode?: boolean;
 	};
 };
 
-type EffectivePolicy = {
+type EffectiveSettings = {
 	version: number;
 	mode: PermissionMode;
-	bash: {
-		allowExact: string[];
-		allowPrefixes: string[];
-		denyPatterns: string[];
-	};
-	tools: {
-		allow: string[];
-	};
-	paths: {
-		denyRead: string[];
-		denyWrite: string[];
-		sensitive: string[];
-	};
 	mainEditor: {
 		vimMode: boolean;
 	};
 };
-
-type SessionPolicy = {
-	bashExact: Set<string>;
-	bashPrefixes: Set<string>;
-	tools: Set<string>;
-};
-
-const DEFAULT_CONFIG: PermissionConfig = {
-    version: 1,
-    mode: "auto",
-    bash: {
-		allowExact: [],
-		allowPrefixes: [],
-		denyPatterns: [],
-	},
-	tools: {
-		allow: [],
-	},
-	paths: {
-		denyRead: [],
-		denyWrite: [],
-		sensitive: [
-			".env",
-			".env.*",
-			"**/.env",
-			"**/.env.*",
-			"**/*secret*",
-			"**/*credential*",
-			"**/*token*",
-			"**/id_rsa",
-			"**/id_ed25519",
-			"**/*.pem",
-			"**/*.key",
-		],
-	},
-	mainEditor: { vimMode: false },
-};
-
-const sessionPolicy: SessionPolicy = {
-	bashExact: new Set(),
-	bashPrefixes: new Set(),
-	tools: new Set(),
-};
-
-let globalConfig: PermissionConfig = {};
-let projectConfig: PermissionConfig = {};
-let effective: EffectivePolicy = mergeConfigs(DEFAULT_CONFIG, {}, {});
-let sessionModeOverride: PermissionMode | undefined;
-
-const NORMAL_KEYS: Record<string, string | null> = {
-	h: "\x1b[D",
-	j: "\x1b[B",
-	k: "\x1b[A",
-	l: "\x1b[C",
-	"0": "\x01",
-	$: "\x05",
-	x: "\x1b[3~",
-	i: null,
-	a: null,
-};
-
-const DIFF_CONTEXT_LINES = 4;
-const DIFF_PREVIEW_VISIBLE_LINES = 18;
-const DIFF_CELL_THRESHOLD = 4_000_000;
-
-type DiffTool = "write" | "edit";
-type DiffLineKind = "added" | "removed" | "context" | "skip";
-type PermissionTheme = ExtensionContext["ui"]["theme"];
-type ApprovalChoice = "allow" | "deny";
 
 type TextEdit = { oldText: string; newText: string };
 
@@ -153,6 +64,33 @@ type DiffPreview = {
 	noChanges: boolean;
 	exact: boolean;
 };
+
+type DangerousCommandClassification = {
+	block?: boolean;
+	confirm?: boolean;
+	reason?: string;
+};
+
+const DEFAULT_CONFIG: EffectiveSettings = {
+	version: 2,
+	mode: "auto",
+	mainEditor: { vimMode: false },
+};
+
+const NORMAL_KEYS: Record<string, string | null> = {
+	h: "\x1b[D",
+	j: "\x1b[B",
+	k: "\x1b[A",
+	l: "\x1b[C",
+	"0": "\x01",
+	$: "\x05",
+	x: "\x1b[3~",
+	i: null,
+	a: null,
+};
+
+let effective: EffectiveSettings = mergeConfigs(DEFAULT_CONFIG);
+let sessionModeOverride: PermissionMode | undefined;
 
 class VimEditor extends CustomEditor {
 	private mode: "normal" | "insert" = "insert";
@@ -302,7 +240,7 @@ class DiffApprovalComponent {
 			this.theme.fg("accent", this.theme.bold(`Approve ${tool} diff`)),
 			`${this.theme.fg("muted", "File:")} ${this.theme.fg("accent", this.preview.path)}`,
 			truncateToWidth(`${this.theme.fg("muted", "Changes:")} ${summary}${precision}`, width),
-			this.theme.fg("dim", "Read-only diff preview. The proposed output cannot be edited."),
+			this.theme.fg("dim", "Ask mode uses this read-only diff gate for write/edit. The proposed output cannot be edited."),
 		];
 	}
 
@@ -373,19 +311,163 @@ class DiffApprovalComponent {
 	}
 }
 
-function alignHighlightedLines(sourceLines: string[], highlightedLines: string[]): string[] {
-	if (highlightedLines.length === sourceLines.length) return highlightedLines;
-	return sourceLines.map((line, index) => highlightedLines[index] ?? line);
+export default function permissionsExtension(pi: ExtensionAPI) {
+	pi.on("session_start", async (_event, ctx) => {
+		reloadSettings(ctx.cwd);
+		if (effective.mainEditor.vimMode) {
+			ctx.ui.setEditorComponent((tui, theme, kb) => new VimEditor(tui, theme, kb));
+		}
+		updateStatus(ctx);
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (isToolCallEventType("bash", event)) {
+			return handleBash(event.input, ctx);
+		}
+
+		if (isToolCallEventType("write", event)) {
+			return handleWrite(event.input, ctx);
+		}
+
+		if (isToolCallEventType("edit", event)) {
+			return handleEdit(event.input, ctx);
+		}
+
+		// Reads and all other tools are intentionally allowed. This extension now only
+		// gates dangerous bash and ask-mode write/edit diffs.
+	});
+
+	pi.registerCommand("permissions", {
+		description: "Show simplified permission mode summary",
+		handler: async (_args, ctx) => {
+			reloadSettings(ctx.cwd);
+			updateStatus(ctx);
+			ctx.ui.notify(formatSummary(ctx.cwd), "info");
+		},
+	});
+
+	pi.registerCommand("permissions-mode", {
+		description: "Show or set permission mode: /permissions-mode ask|auto",
+		handler: async (args, ctx) => {
+			const requested = parseModeArg(args);
+			if (!requested) {
+				if ((args || "").trim()) ctx.ui.notify("Usage: /permissions-mode [ask|auto]", "warning");
+				else ctx.ui.notify(`Permissions mode: ${currentMode()}${sessionModeOverride ? " (session override)" : ""}`, "info");
+				return;
+			}
+			sessionModeOverride = requested;
+			updateStatus(ctx);
+			ctx.ui.notify(formatModeChange(requested), "info");
+		},
+	});
+
+	pi.registerCommand("permissions-auto", {
+		description: "Toggle full auto approval: /permissions-auto [on|off|toggle]",
+		handler: async (args, ctx) => {
+			const action = (args || "toggle").trim().toLowerCase();
+			let nextMode: PermissionMode;
+			if (["on", "true", "1", "enable", "enabled", "auto"].includes(action)) nextMode = "auto";
+			else if (["off", "false", "0", "disable", "disabled", "ask", "manual"].includes(action)) nextMode = "ask";
+			else if (action === "" || action === "toggle") nextMode = currentMode() === "auto" ? "ask" : "auto";
+			else {
+				ctx.ui.notify("Usage: /permissions-auto [on|off|toggle]", "warning");
+				return;
+			}
+			sessionModeOverride = nextMode;
+			updateStatus(ctx);
+			ctx.ui.notify(formatModeChange(nextMode), "info");
+		},
+	});
+
+	pi.registerCommand("permissions-reload", {
+		description: "Reload lightweight permission preferences",
+		handler: async (_args, ctx) => {
+			reloadSettings(ctx.cwd);
+			updateStatus(ctx);
+			ctx.ui.notify("Permissions preferences reloaded", "info");
+		},
+	});
+
+	pi.registerCommand("permissions-edit", {
+		description: "Edit lightweight permissions preferences: /permissions-edit global|project",
+		handler: async (args, ctx) => {
+			const scope = (args || "").trim();
+			if (scope !== "global" && scope !== "project") {
+				ctx.ui.notify("Usage: /permissions-edit global|project", "warning");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Cannot edit permissions without UI", "error");
+				return;
+			}
+			const file = scope === "global" ? GLOBAL_CONFIG : path.join(ctx.cwd, PROJECT_CONFIG);
+			ensureConfigFile(file);
+			const current = fs.readFileSync(file, "utf8");
+			const edited = await ctx.ui.editor(`Edit ${scope} permissions preferences: ${file}`, current);
+			if (edited === undefined) return;
+			try {
+				const parsed = JSON.parse(edited) as PermissionConfig;
+				assertValidPreferences(parsed);
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, edited.endsWith("\n") ? edited : `${edited}\n`, "utf8");
+				reloadSettings(ctx.cwd);
+				updateStatus(ctx);
+				ctx.ui.notify(`Saved ${scope} permissions preferences`, "info");
+			} catch (error) {
+				ctx.ui.notify(`Invalid permissions preferences; not saved: ${formatError(error)}`, "error");
+			}
+		},
+	});
 }
 
-function highlightDiffSourceLines(sourceLines: string[], language: string | undefined): string[] {
-	const displayLines = sourceLines.map(replaceTabs);
-	if (!language || displayLines.length === 0) return displayLines;
-	return alignHighlightedLines(displayLines, highlightCode(displayLines.join("\n"), language));
+async function handleBash(input: { command: string; timeout?: number }, ctx: ExtensionContext) {
+	const command = input.command.trim();
+	const danger = classifyDangerousCommand(command);
+	if (danger.block) return { block: true, reason: danger.reason };
+	if (!danger.confirm) return;
+
+	if (!ctx.hasUI) {
+		return { block: true, reason: `Dangerous bash command requires approval: ${command}` };
+	}
+
+	const approved = await requestDangerousCommandApproval(ctx, command, danger.reason);
+	if (!approved) return { block: true, reason: `Denied dangerous bash command: ${command}` };
 }
 
-function replaceTabs(text: string): string {
-	return text.replace(/\t/g, "   ");
+async function handleWrite(input: { path: string; content: string }, ctx: ExtensionContext) {
+	if (currentMode() === "auto") return;
+	if (!ctx.hasUI) return { block: true, reason: `Write requires ask-mode diff approval: ${input.path}` };
+
+	let preview: DiffPreview;
+	try {
+		preview = buildWriteDiffPreview(input, ctx.cwd);
+	} catch (error) {
+		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
+	}
+
+	const approved = await requestDiffApproval(ctx, preview);
+	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
+}
+
+async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
+	if (currentMode() === "auto") return;
+	if (!ctx.hasUI) return { block: true, reason: `Edit requires ask-mode diff approval: ${input.path}` };
+
+	let preview: DiffPreview;
+	try {
+		preview = buildEditDiffPreview(input, ctx.cwd);
+	} catch (error) {
+		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
+	}
+
+	const approved = await requestDiffApproval(ctx, preview);
+	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
+}
+
+async function requestDangerousCommandApproval(ctx: ExtensionContext, command: string, reason: string | undefined): Promise<boolean> {
+	const reasonLine = reason ? `\n\nReason: ${reason}` : "";
+	const choice = await ctx.ui.select(`Dangerous bash command flagged:\n\n${command}${reasonLine}\n\nRun it anyway?`, ["Deny", "Allow"]);
+	return choice === "Allow";
 }
 
 async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
@@ -582,6 +664,21 @@ function groupDiffOps(ops: RawDiffOp[]): DiffSegment[] {
 	return segments;
 }
 
+function alignHighlightedLines(sourceLines: string[], highlightedLines: string[]): string[] {
+	if (highlightedLines.length === sourceLines.length) return highlightedLines;
+	return sourceLines.map((line, index) => highlightedLines[index] ?? line);
+}
+
+function highlightDiffSourceLines(sourceLines: string[], language: string | undefined): string[] {
+	const displayLines = sourceLines.map(replaceTabs);
+	if (!language || displayLines.length === 0) return displayLines;
+	return alignHighlightedLines(displayLines, highlightCode(displayLines.join("\n"), language));
+}
+
+function replaceTabs(text: string): string {
+	return text.replace(/\t/g, "   ");
+}
+
 function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
@@ -695,246 +792,30 @@ function formatNoChangeError(filePath: string, totalEdits: number): string {
 		: `No changes made to ${filePath}. The replacements produced identical content.`;
 }
 
-function getErrorCode(error: unknown): string | undefined {
-	return typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
-}
-
-function formatError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-export default function permissionsExtension(pi: ExtensionAPI) {
-    pi.on("session_start", async (_event, ctx) => {
-        reloadPolicy(ctx.cwd);
-        if (effective.mainEditor.vimMode) {
-            ctx.ui.setEditorComponent((tui, theme, kb) => new VimEditor(tui, theme, kb));
-        }
-        updateStatus(ctx);
-    });
-
-	pi.on("tool_call", async (event, ctx) => {
-		if (isToolCallEventType("read", event)) {
-			return handleRead(event.input.path, ctx);
-		}
-
-		if (isToolCallEventType("bash", event)) {
-			return handleBash(event.input, ctx);
-		}
-
-		if (isToolCallEventType("write", event)) {
-			return handleWrite(event.input, ctx);
-		}
-
-		if (isToolCallEventType("edit", event)) {
-			return handleEdit(event.input, ctx);
-		}
-
-		if (!BUILTIN_TOOLS.has(event.toolName)) {
-			return handleUnknownTool(event.toolName, ctx);
-		}
-	});
-
-    pi.registerCommand("permissions", {
-        description: "Show effective permission policy summary",
-        handler: async (_args, ctx) => {
-            reloadPolicy(ctx.cwd);
-            updateStatus(ctx);
-            ctx.ui.notify(formatSummary(ctx.cwd), "info");
-        },
-    });
-
-    pi.registerCommand("permissions-mode", {
-        description: "Show or set permission mode: /permissions-mode ask|auto",
-        handler: async (args, ctx) => {
-            const requested = parseModeArg(args);
-            if (!requested) {
-                if ((args || "").trim()) ctx.ui.notify("Usage: /permissions-mode [ask|auto]", "warning");
-                else ctx.ui.notify(`Permissions mode: ${currentMode()}${sessionModeOverride ? " (session override)" : ""}`, "info");
-                return;
-            }
-            sessionModeOverride = requested;
-            updateStatus(ctx);
-            ctx.ui.notify(formatModeChange(requested), "info");
-        },
-    });
-
-    pi.registerCommand("permissions-auto", {
-        description: "Toggle Claude-Code-like auto approval: /permissions-auto [on|off|toggle]",
-        handler: async (args, ctx) => {
-            const action = (args || "toggle").trim().toLowerCase();
-            let nextMode: PermissionMode;
-            if (["on", "true", "1", "enable", "enabled", "auto"].includes(action)) nextMode = "auto";
-            else if (["off", "false", "0", "disable", "disabled", "ask", "manual"].includes(action)) nextMode = "ask";
-            else if (action === "" || action === "toggle") nextMode = currentMode() === "auto" ? "ask" : "auto";
-            else {
-                ctx.ui.notify("Usage: /permissions-auto [on|off|toggle]", "warning");
-                return;
-            }
-            sessionModeOverride = nextMode;
-            updateStatus(ctx);
-            ctx.ui.notify(formatModeChange(nextMode), "info");
-        },
-    });
-
-    pi.registerCommand("permissions-reload", {
-        description: "Reload permission config files",
-        handler: async (_args, ctx) => {
-            reloadPolicy(ctx.cwd);
-            updateStatus(ctx);
-            ctx.ui.notify("Permissions reloaded", "info");
-        },
-    });
-
-	pi.registerCommand("permissions-edit", {
-		description: "Edit permission config: /permissions-edit global|project",
-		handler: async (args, ctx) => {
-			const scope = (args || "").trim();
-			if (scope !== "global" && scope !== "project") {
-				ctx.ui.notify("Usage: /permissions-edit global|project", "warning");
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Cannot edit permissions without UI", "error");
-				return;
-			}
-			const file = scope === "global" ? GLOBAL_CONFIG : path.join(ctx.cwd, PROJECT_CONFIG);
-			ensureConfigFile(file);
-			const current = fs.readFileSync(file, "utf8");
-			const edited = await ctx.ui.editor(`Edit ${scope} permissions: ${file}`, current);
-			if (edited === undefined) return;
-			try {
-				JSON.parse(edited);
-				fs.mkdirSync(path.dirname(file), { recursive: true });
-				fs.writeFileSync(file, edited.endsWith("\n") ? edited : `${edited}\n`, "utf8");
-				reloadPolicy(ctx.cwd);
-				updateStatus(ctx);
-				ctx.ui.notify(`Saved ${scope} permissions`, "info");
-			} catch (error) {
-				ctx.ui.notify(`Invalid JSON; not saved: ${error instanceof Error ? error.message : String(error)}`, "error");
-			}
-		},
-	});
-}
-
-async function handleRead(filePath: string, ctx: ExtensionContext) {
-	const resolved = resolveForPolicy(filePath, ctx.cwd);
-	if (matchesAnyPath(resolved, [...effective.paths.denyRead, ...effective.paths.sensitive], ctx.cwd)) {
-		return { block: true, reason: `Read blocked by permissions policy: ${filePath}` };
+function classifyDangerousCommand(command: string): DangerousCommandClassification {
+	const c = command.replace(/\s+/g, " ").trim();
+	if (/\brm\s+-(?=[A-Za-z]*r)(?=[A-Za-z]*f)[A-Za-z]*\s+(\/|~|\*|\.\s*$|\.\/\*)/.test(c)) {
+		return { block: true, reason: "Catastrophic recursive delete blocked" };
 	}
+	if (/\brm\s+(?=[^;&|]*\s)(?=[^;&|]*-[A-Za-z]*[rR])/.test(c)) return { confirm: true, reason: "Recursive delete" };
+	if (/\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/.test(c)) return { confirm: true, reason: "Network pipe-to-shell" };
+	if (/^\s*(sudo|su)\b/.test(c)) return { confirm: true, reason: "Privilege escalation" };
+	if (/\bgit\s+clean\b.*-[^\s]*f/.test(c)) return { confirm: true, reason: "Destructive git clean" };
+	if (/\bgit\s+reset\s+(--hard|--merge|--keep)\b/.test(c)) return { confirm: true, reason: "Destructive git reset" };
+	if (/\bgit\s+(checkout|restore)\s+(--|\.|:\/)/.test(c)) return { confirm: true, reason: "Discarding git changes" };
+	if (/\b(chmod|chown)\s+-[A-Za-z]*R[A-Za-z]*\b/.test(c)) return { confirm: true, reason: "Recursive permission/ownership change" };
+	if (/\b(dd|mkfs(?:\.\w+)?|fdisk|diskpart)\b/.test(c)) return { confirm: true, reason: "Disk operation" };
+	return {};
 }
 
-async function handleBash(input: { command: string; timeout?: number }, ctx: ExtensionContext) {
-    const command = input.command.trim();
-    const danger = classifyDangerousCommand(command);
-    if (danger.block) return { block: true, reason: danger.reason };
-    if (isBashDenied(command)) return { block: true, reason: `Bash blocked by deny pattern: ${command}` };
-
-    if (!danger.confirm && isReadOnlyBashCommand(command)) return;
-    if (isBashAllowed(command) && !danger.confirm) return;
-    if (currentMode() === "auto" && !danger.confirm) return;
-
-    if (!ctx.hasUI) return { block: true, reason: `Bash command requires approval: ${command}` };
-
-	const choices = [
-		"Deny",
-		"Allow once",
-		"Allow for this session",
-		"Allow this exact command for this project",
-		"Allow this command prefix for this project",
-		"Allow this exact command globally",
-	];
-	const title = danger.confirm ? "Dangerous bash command requires extra approval" : "Approve bash command";
-	const choice = await ctx.ui.select(`${title}:\n\n${command}\n\n${danger.reason ?? ""}`, choices);
-	if (!choice || choice === "Deny") return { block: true, reason: `Denied bash command: ${command}` };
-
-	if (danger.confirm) {
-		const ok = await ctx.ui.confirm("Confirm dangerous command", `Run anyway?\n\n${command}`);
-		if (!ok) return { block: true, reason: `Denied dangerous bash command: ${command}` };
-	}
-
-	if (choice === "Allow for this session") sessionPolicy.bashExact.add(command);
-	else if (choice === "Allow this exact command for this project") {
-		sessionPolicy.bashExact.add(command);
-		addProjectRule(ctx.cwd, (cfg) => addUnique(cfg.bash!, "allowExact", command));
-	} else if (choice === "Allow this command prefix for this project") {
-		const prefix = await ctx.ui.input("Command prefix to allow for this project", suggestPrefix(command));
-		if (!prefix) return { block: true, reason: "No prefix supplied" };
-		sessionPolicy.bashPrefixes.add(prefix);
-		addProjectRule(ctx.cwd, (cfg) => addUnique(cfg.bash!, "allowPrefixes", prefix));
-	} else if (choice === "Allow this exact command globally") {
-		sessionPolicy.bashExact.add(command);
-		addGlobalRule((cfg) => addUnique(cfg.bash!, "allowExact", command));
-	}
-}
-
-async function handleWrite(input: { path: string; content: string }, ctx: ExtensionContext) {
-    if (matchesAnyPath(resolveForPolicy(input.path, ctx.cwd), [...effective.paths.denyWrite, ...effective.paths.sensitive], ctx.cwd)) {
-        return { block: true, reason: `Write blocked by permissions policy: ${input.path}` };
-    }
-    if (currentMode() === "auto") return;
-    if (!ctx.hasUI) return { block: true, reason: `Write requires diff approval: ${input.path}` };
-
-	let preview: DiffPreview;
-	try {
-		preview = buildWriteDiffPreview(input, ctx.cwd);
-	} catch (error) {
-		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
-	}
-
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
-}
-
-async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
-    if (matchesAnyPath(resolveForPolicy(input.path, ctx.cwd), [...effective.paths.denyWrite, ...effective.paths.sensitive], ctx.cwd)) {
-        return { block: true, reason: `Edit blocked by permissions policy: ${input.path}` };
-    }
-    if (currentMode() === "auto") return;
-    if (!ctx.hasUI) return { block: true, reason: `Edit requires diff approval: ${input.path}` };
-
-	let preview: DiffPreview;
-	try {
-		preview = buildEditDiffPreview(input, ctx.cwd);
-	} catch (error) {
-		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
-	}
-
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
-}
-
-async function handleUnknownTool(toolName: string, ctx: ExtensionContext) {
-    if (effective.tools.allow.includes(toolName) || sessionPolicy.tools.has(toolName)) return;
-    if (currentMode() === "auto") return;
-    if (!ctx.hasUI) return { block: true, reason: `Tool requires approval: ${toolName}` };
-	const choice = await ctx.ui.select(`Approve tool call: ${toolName}`, [
-		"Deny",
-		"Allow once",
-		"Allow this tool for this session",
-		"Allow this tool by name for this project",
-		"Allow this tool by name globally",
-	]);
-	if (!choice || choice === "Deny") return { block: true, reason: `Denied tool: ${toolName}` };
-	if (choice === "Allow this tool for this session") sessionPolicy.tools.add(toolName);
-	else if (choice === "Allow this tool by name for this project") {
-		sessionPolicy.tools.add(toolName);
-		addProjectRule(ctx.cwd, (cfg) => addUnique(cfg.tools!, "allow", toolName));
-	} else if (choice === "Allow this tool by name globally") {
-		sessionPolicy.tools.add(toolName);
-		addGlobalRule((cfg) => addUnique(cfg.tools!, "allow", toolName));
-	}
-}
-
-function reloadPolicy(cwd: string) {
-	globalConfig = readConfig(GLOBAL_CONFIG);
-	projectConfig = readConfig(path.join(cwd, PROJECT_CONFIG));
-	effective = mergeConfigs(DEFAULT_CONFIG, globalConfig, projectConfig);
+function reloadSettings(cwd: string) {
+	effective = mergeConfigs(DEFAULT_CONFIG, readConfig(GLOBAL_CONFIG), readConfig(path.join(cwd, PROJECT_CONFIG)));
 }
 
 function readConfig(file: string): PermissionConfig {
 	try {
 		if (!fs.existsSync(file)) return {};
-		return JSON.parse(fs.readFileSync(file, "utf8"));
+		return JSON.parse(fs.readFileSync(file, "utf8")) as PermissionConfig;
 	} catch {
 		return {};
 	}
@@ -946,397 +827,68 @@ function ensureConfigFile(file: string) {
 	fs.writeFileSync(file, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, "utf8");
 }
 
-function mergeConfigs(...configs: PermissionConfig[]): EffectivePolicy {
-    const merged: EffectivePolicy = {
-        version: 1,
-        mode: "auto",
-        bash: { allowExact: [], allowPrefixes: [], denyPatterns: [] },
-		tools: { allow: [] },
-		paths: { denyRead: [], denyWrite: [], sensitive: [] },
-		mainEditor: { vimMode: false },
+function mergeConfigs(...configs: PermissionConfig[]): EffectiveSettings {
+	const merged: EffectiveSettings = {
+		version: DEFAULT_CONFIG.version,
+		mode: DEFAULT_CONFIG.mode,
+		mainEditor: { vimMode: DEFAULT_CONFIG.mainEditor.vimMode },
 	};
-    for (const cfg of configs) {
-        merged.version = cfg.version ?? merged.version;
-        merged.mode = cfg.mode ?? merged.mode;
-        pushAll(merged.bash.allowExact, cfg.bash?.allowExact);
-		pushAll(merged.bash.allowPrefixes, cfg.bash?.allowPrefixes);
-		pushAll(merged.bash.denyPatterns, cfg.bash?.denyPatterns);
-		pushAll(merged.tools.allow, cfg.tools?.allow);
-		pushAll(merged.paths.denyRead, cfg.paths?.denyRead);
-		pushAll(merged.paths.denyWrite, cfg.paths?.denyWrite);
-		pushAll(merged.paths.sensitive, cfg.paths?.sensitive);
+	for (const cfg of configs) {
+		merged.version = cfg.version ?? merged.version;
+		if (cfg.mode === "ask" || cfg.mode === "auto") merged.mode = cfg.mode;
 		merged.mainEditor.vimMode = cfg.mainEditor?.vimMode ?? merged.mainEditor.vimMode;
 	}
 	return merged;
 }
 
-function isBashAllowed(command: string): boolean {
-    if (sessionPolicy.bashExact.has(command)) return true;
-    if ([...sessionPolicy.bashPrefixes].some((prefix) => command.startsWith(prefix))) return true;
-    if (isBashDenied(command)) return false;
-    if (effective.bash.allowExact.includes(command)) return true;
-    return effective.bash.allowPrefixes.some((prefix) => command.startsWith(prefix));
-}
-
-const READ_ONLY_SIMPLE_COMMANDS = new Set([
-    "[",
-    "basename",
-    "cat",
-    "cd",
-    "cut",
-    "date",
-    "df",
-    "dir",
-    "dirname",
-    "du",
-    "echo",
-    "expr",
-    "false",
-    "file",
-    "grep",
-    "head",
-    "hostname",
-    "id",
-    "jq",
-    "less",
-    "ls",
-    "more",
-    "printenv",
-    "printf",
-    "pwd",
-    "readlink",
-    "realpath",
-    "rg",
-    "stat",
-    "tail",
-    "test",
-    "tr",
-    "true",
-    "uname",
-    "uniq",
-    "wc",
-    "where",
-    "whereis",
-    "which",
-    "whoami",
-]);
-
-function isReadOnlyBashCommand(command: string): boolean {
-    if (!command.trim()) return true;
-    if (/[`]/.test(command) || command.includes("$(") || command.includes("<(") || command.includes(">(")) return false;
-
-    const tokens = tokenizeShell(command);
-    if (!tokens) return false;
-
-    const segments: string[][] = [];
-    let current: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-        const token = tokens[i]!;
-        if (isOutputRedirection(token)) return false;
-        if (token === "<" || token === "<<") {
-            i++;
-            continue;
-        }
-        if (isCommandSeparator(token)) {
-            if (current.length === 0) return false;
-            segments.push(current);
-            current = [];
-            continue;
-        }
-        if (token === "&") return false;
-        current.push(token);
-    }
-    if (current.length) segments.push(current);
-    return segments.length > 0 && segments.every(isReadOnlyCommandSegment);
-}
-
-function tokenizeShell(command: string): string[] | undefined {
-    const tokens: string[] = [];
-    let token = "";
-    let quote: "'" | '"' | undefined;
-
-    const pushToken = () => {
-        if (token) {
-            tokens.push(token);
-            token = "";
-        }
-    };
-
-    for (let i = 0; i < command.length; i++) {
-        const ch = command[i]!;
-        if (quote) {
-            if (ch === quote) quote = undefined;
-            else if (quote === '"' && ch === "\\" && i + 1 < command.length) token += command[++i]!;
-            else token += ch;
-            continue;
-        }
-
-        if (ch === "'" || ch === '"') {
-            quote = ch;
-            continue;
-        }
-        if (ch === "\\") {
-            if (i + 1 >= command.length) return undefined;
-            token += command[++i]!;
-            continue;
-        }
-        if (/\s/.test(ch)) {
-            pushToken();
-            continue;
-        }
-        if (";|&<>".includes(ch)) {
-            pushToken();
-            const next = command[i + 1];
-            if ((ch === "&" && next === "&") || (ch === "|" && next === "|") || (ch === ">" && next === ">") || (ch === "<" && next === "<")) {
-                tokens.push(`${ch}${next}`);
-                i++;
-            } else {
-                tokens.push(ch);
-            }
-            continue;
-        }
-        token += ch;
-    }
-
-    if (quote) return undefined;
-    pushToken();
-    return tokens;
-}
-
-function isCommandSeparator(token: string): boolean {
-    return token === "|" || token === "&&" || token === "||" || token === ";";
-}
-
-function isOutputRedirection(token: string): boolean {
-    return token === ">" || token === ">>";
-}
-
-function isReadOnlyCommandSegment(tokens: string[]): boolean {
-    let index = 0;
-    while (isEnvAssignment(tokens[index])) index++;
-    if (index >= tokens.length) return true;
-
-    if (tokens[index] === "time") index++;
-    if (tokens[index] === "command" || tokens[index] === "builtin") {
-        if (tokens[index + 1] === "-v" || tokens[index + 1] === "-V") return true;
-        index++;
-    }
-
-    const commandName = tokens[index]!;
-    const args = tokens.slice(index + 1);
-
-    if (commandName === "env") return isReadOnlyEnvCommand(args);
-    if (commandName === "find") return isReadOnlyFindCommand(args);
-    if (commandName === "git") return isReadOnlyGitCommand(args);
-    if (commandName === "node" || commandName === "python" || commandName === "python3") return args.length > 0 && args.every(isVersionOrHelpFlag);
-    if (commandName === "npm") return isReadOnlyNpmCommand(args);
-    if (commandName === "sort") return !hasOption(args, "-o", "--output");
-    if (commandName === "yq") return !hasOption(args, "-i", "--inplace");
-
-    return READ_ONLY_SIMPLE_COMMANDS.has(commandName);
-}
-
-function isReadOnlyEnvCommand(args: string[]): boolean {
-    let index = 0;
-    while (index < args.length) {
-        const arg = args[index]!;
-        if (isEnvAssignment(arg) || arg === "-i" || arg === "--ignore-environment") {
-            index++;
-            continue;
-        }
-        if (arg === "-u" || arg === "--unset" || arg === "-C" || arg === "--chdir") {
-            index += 2;
-            continue;
-        }
-        if (arg.startsWith("--unset=") || arg.startsWith("--chdir=")) {
-            index++;
-            continue;
-        }
-        break;
-    }
-    return index >= args.length || isReadOnlyCommandSegment(args.slice(index));
-}
-
-function isReadOnlyFindCommand(args: string[]): boolean {
-    return !args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf"].includes(arg));
-}
-
-function isReadOnlyGitCommand(args: string[]): boolean {
-    const parsed = parseGitSubcommand(args);
-    if (!parsed) return args.length === 0 || args.some((arg) => arg === "--version" || arg === "--help");
-    const { subcommand, subArgs } = parsed;
-    if (hasOption(subArgs, "-o", "--output")) return false;
-
-    if (["blame", "describe", "diff", "grep", "log", "ls-files", "ls-tree", "rev-list", "rev-parse", "shortlog", "show", "status", "version"].includes(subcommand)) return true;
-    if (subcommand === "branch") return isReadOnlyGitBranchCommand(subArgs);
-    if (subcommand === "remote") return subArgs.length === 0 || subArgs[0] === "-v" || ["get-url", "show"].includes(subArgs[0]!);
-    if (subcommand === "config") return isReadOnlyGitConfigCommand(subArgs);
-    if (subcommand === "stash") return subArgs[0] === "list" || subArgs[0] === "show";
-    return false;
-}
-
-function parseGitSubcommand(args: string[]): { subcommand: string; subArgs: string[] } | undefined {
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i]!;
-        if (["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(arg)) {
-            i++;
-            continue;
-        }
-        if (arg.startsWith("-C") || arg.startsWith("-c") || arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=") || arg.startsWith("--namespace=")) continue;
-        if (arg === "--no-pager" || arg === "--paginate" || arg === "--version" || arg === "--help") continue;
-        if (arg.startsWith("-")) return undefined;
-        return { subcommand: arg, subArgs: args.slice(i + 1) };
-    }
-    return undefined;
-}
-
-function isReadOnlyGitBranchCommand(args: string[]): boolean {
-    return args.every((arg) => ["-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "--list", "--no-color"].includes(arg) || arg.startsWith("--format=") || arg.startsWith("--sort=") || arg.startsWith("--color="));
-}
-
-function isReadOnlyGitConfigCommand(args: string[]): boolean {
-    if (args.some((arg) => ["--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "add", "set", "unset", "rename-section", "remove-section"].includes(arg))) return false;
-    return args.some((arg) => ["--get", "--get-all", "--get-regexp", "--list", "--name-only", "get", "list"].includes(arg));
-}
-
-function isReadOnlyNpmCommand(args: string[]): boolean {
-    const command = args.find((arg) => !arg.startsWith("-"));
-    return !!command && ["info", "list", "ls", "outdated", "root", "view", "why"].includes(command);
-}
-
-function isVersionOrHelpFlag(arg: string): boolean {
-    return arg === "-v" || arg === "--version" || arg === "-h" || arg === "--help";
-}
-
-function hasOption(args: string[], short: string, long: string): boolean {
-    return args.some((arg) => arg === short || arg.startsWith(`${short}`) || arg === long || arg.startsWith(`${long}=`));
-}
-
-function isEnvAssignment(token: string | undefined): boolean {
-    return !!token && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token);
-}
-
-function isBashDenied(command: string): boolean {
-    return effective.bash.denyPatterns.some((pattern) => new RegExp(pattern).test(command));
+function assertValidPreferences(cfg: PermissionConfig) {
+	if (cfg.mode !== undefined && cfg.mode !== "ask" && cfg.mode !== "auto") throw new Error('"mode" must be "ask" or "auto"');
+	if (cfg.mainEditor?.vimMode !== undefined && typeof cfg.mainEditor.vimMode !== "boolean") throw new Error('"mainEditor.vimMode" must be a boolean');
 }
 
 function currentMode(): PermissionMode {
-    return sessionModeOverride ?? effective.mode;
+	return sessionModeOverride ?? effective.mode;
 }
 
 function parseModeArg(args: string | undefined): PermissionMode | undefined {
-    const raw = (args || "").trim().toLowerCase();
-    if (["auto", "on", "enable", "enabled"].includes(raw)) return "auto";
-    if (["ask", "manual", "off", "disable", "disabled"].includes(raw)) return "ask";
-    return undefined;
+	const raw = (args || "").trim().toLowerCase();
+	if (["auto", "on", "enable", "enabled"].includes(raw)) return "auto";
+	if (["ask", "manual", "off", "disable", "disabled"].includes(raw)) return "ask";
+	return undefined;
 }
 
 function formatModeChange(mode: PermissionMode): string {
-    return mode === "auto"
-        ? "Permissions auto mode enabled: non-sensitive writes/edits, non-dangerous bash (including read-only), and custom tools are auto-approved; dangerous bash still prompts/blocks."
-        : "Permissions ask mode enabled: read-only bash is auto-approved; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits require read-only diff approval.";
+	return mode === "auto"
+		? "Permissions auto mode enabled: reads, writes/edits, non-dangerous bash, and custom tools are allowed automatically; dangerous bash still prompts or blocks."
+		: "Permissions ask mode enabled: reads, non-dangerous bash, and custom tools are allowed automatically; writes/edits show a read-only diff approval; dangerous bash still prompts or blocks.";
 }
 
 function updateStatus(ctx: { ui: ExtensionContext["ui"] }) {
-    ctx.ui.setStatus("permissions", `permissions: ${currentMode()}`);
+	ctx.ui.setStatus("permissions", `permissions: ${currentMode()}`);
 }
 
-function classifyDangerousCommand(command: string): { block?: boolean; confirm?: boolean; reason?: string } {
-    const c = command.replace(/\s+/g, " ").trim();
-    if (/\brm\s+-(?=[A-Za-z]*r)(?=[A-Za-z]*f)[A-Za-z]*\s+(\/|~|\*|\.\s*$|\.\/\*)/.test(c)) {
-        return { block: true, reason: "Catastrophic recursive delete blocked" };
-    }
-    if (/\brm\s+(?=[^;&|]*\s)(?=[^;&|]*-[A-Za-z]*[rR])/.test(c)) return { confirm: true, reason: "Recursive delete" };
-    if (/\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/.test(c)) return { confirm: true, reason: "Network pipe-to-shell" };
-    if (/^\s*(sudo|su)\b/.test(c)) return { confirm: true, reason: "Privilege escalation" };
-    if (/\bgit\s+clean\b.*-[^\s]*f/.test(c)) return { confirm: true, reason: "Destructive git clean" };
-    if (/\bgit\s+reset\s+(--hard|--merge|--keep)\b/.test(c)) return { confirm: true, reason: "Destructive git reset" };
-    if (/\bgit\s+(checkout|restore)\s+(--|\.|:\/)/.test(c)) return { confirm: true, reason: "Discarding git changes" };
-    if (/\b(chmod|chown)\s+-[A-Za-z]*R[A-Za-z]*\b/.test(c)) return { confirm: true, reason: "Recursive permission/ownership change" };
-    if (/\b(dd|mkfs(?:\.\w+)?|fdisk|diskpart)\b/.test(c)) return { confirm: true, reason: "Disk operation" };
-    return {};
+function formatSummary(cwd: string): string {
+	return [
+		"Permissions guardrails",
+		`Global preferences: ${GLOBAL_CONFIG}`,
+		`Project preferences: ${path.join(cwd, PROJECT_CONFIG)}`,
+		`Mode: ${currentMode()}${sessionModeOverride ? " (session override)" : ""}`,
+		"Read/custom tools: allowed",
+		"Write/edit: allowed in auto mode; read-only diff Allow/Deny in ask mode",
+		"Bash: non-dangerous commands allowed; dangerous commands prompt or block in every mode",
+		"Granular session/project/global allowlists, denylists, and path gates: disabled/ignored",
+		`Main editor vim: ${effective.mainEditor.vimMode ? "on" : "off"}`,
+	].join("\n");
 }
 
-function addProjectRule(cwd: string, mutate: (cfg: PermissionConfig) => void) {
-	const file = path.join(cwd, PROJECT_CONFIG);
-	const cfg = mergeConfigForWrite(readConfig(file));
-	mutate(cfg);
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
-	reloadPolicy(cwd);
+function getErrorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
 }
 
-function addGlobalRule(mutate: (cfg: PermissionConfig) => void) {
-	const cfg = mergeConfigForWrite(readConfig(GLOBAL_CONFIG));
-	mutate(cfg);
-	fs.mkdirSync(path.dirname(GLOBAL_CONFIG), { recursive: true });
-	fs.writeFileSync(GLOBAL_CONFIG, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
-}
-
-function mergeConfigForWrite(cfg: PermissionConfig): PermissionConfig {
-    return {
-        version: cfg.version ?? 1,
-        mode: cfg.mode ?? "auto",
-        bash: {
-			allowExact: cfg.bash?.allowExact ?? [],
-			allowPrefixes: cfg.bash?.allowPrefixes ?? [],
-			denyPatterns: cfg.bash?.denyPatterns ?? [],
-		},
-		tools: { allow: cfg.tools?.allow ?? [] },
-		paths: {
-			denyRead: cfg.paths?.denyRead ?? [],
-			denyWrite: cfg.paths?.denyWrite ?? [],
-			sensitive: cfg.paths?.sensitive ?? [],
-		},
-		mainEditor: { vimMode: cfg.mainEditor?.vimMode ?? false },
-	};
-}
-
-function addUnique<T extends Record<string, string[]>, K extends keyof T>(obj: T, key: K, value: string) {
-	obj[key] ??= [] as unknown as T[K];
-	if (!obj[key].includes(value)) obj[key].push(value);
-}
-
-function pushAll(target: string[], source?: string[]) {
-	for (const item of source ?? []) if (!target.includes(item)) target.push(item);
+function formatError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function resolveForPolicy(filePath: string, cwd: string): string {
 	return path.resolve(cwd, filePath);
-}
-
-function matchesAnyPath(absPath: string, patterns: string[], cwd: string): boolean {
-	const rel = path.relative(cwd, absPath).replace(/\\/g, "/");
-	const full = absPath.replace(/\\/g, "/");
-	return patterns.some((pattern) => globMatch(rel, pattern) || globMatch(full, pattern));
-}
-
-function globMatch(value: string, glob: string): boolean {
-	const escaped = glob
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replace(/\*\*/g, "@@DOUBLE_STAR@@")
-		.replace(/\*/g, "[^/]*")
-		.replace(/@@DOUBLE_STAR@@/g, ".*");
-	return new RegExp(`^${escaped}$`).test(value);
-}
-
-function suggestPrefix(command: string): string {
-	const parts = command.trim().split(/\s+/);
-	if (parts[0] === "git" && parts[1]) return `git ${parts[1]}`;
-	if (parts[0] === "npm" && parts[1]) return `npm ${parts[1]}`;
-	return parts[0] ? `${parts[0]} ` : command;
-}
-
-function formatSummary(cwd: string): string {
-    return [
-        "Permissions policy",
-        `Global: ${GLOBAL_CONFIG}`,
-        `Project: ${path.join(cwd, PROJECT_CONFIG)}`,
-        `Mode: ${currentMode()}${sessionModeOverride ? " (session override)" : ""}`,
-        `Bash exact: ${effective.bash.allowExact.length} global/project, ${sessionPolicy.bashExact.size} session`,
-		`Bash prefixes: ${effective.bash.allowPrefixes.length} global/project, ${sessionPolicy.bashPrefixes.size} session`,
-		`Allowed custom tools: ${effective.tools.allow.length} global/project, ${sessionPolicy.tools.size} session`,
-		`Sensitive path patterns: ${effective.paths.sensitive.length}`,
-		`Main editor vim: ${effective.mainEditor.vimMode ? "on" : "off"}`,
-	].join("\n");
 }
