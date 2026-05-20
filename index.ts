@@ -20,7 +20,6 @@ const DIFF_PREVIEW_MAX_TOTAL_LINES = 26;
 const DIFF_PREVIEW_MIN_TOTAL_LINES = 8;
 const DIFF_PREVIEW_TERMINAL_MARGIN_LINES = 6;
 const DIFF_PREVIEW_MIN_BODY_LINES = 1;
-const DIFF_FEEDBACK_MAX_CHARS = 500;
 const DIFF_CELL_THRESHOLD = 4_000_000;
 
 type PermissionMode = "ask" | "auto";
@@ -156,31 +155,23 @@ class DiffApprovalComponent {
 	private selected: ApprovalChoice = "allow";
 	private scrollOffset = 0;
 	private pageSize = DIFF_PREVIEW_MAX_BODY_LINES;
-	private feedback = "";
-	private feedbackCursor = 0;
-	private editingFeedback = false;
 	private highlightedOld: string[] | undefined;
 	private highlightedNew: string[] | undefined;
 
 	constructor(
 		private readonly preview: DiffPreview,
 		private readonly theme: PermissionTheme,
-		private readonly done: (result: DiffApprovalResult) => void,
+		private readonly done: (choice: ApprovalChoice) => void,
 		private readonly getTerminalRows: () => number,
 	) {}
 
 	handleInput(data: string): void {
-		if (this.editingFeedback) {
-			this.handleFeedbackInput(data);
-			return;
-		}
-
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-			this.deny();
+			this.done("deny");
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.submitSelectedChoice();
+			this.done(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.tab) || matchesKey(data, Key.space)) {
@@ -195,11 +186,11 @@ class DiffApprovalComponent {
 			this.selected = this.nextChoice(this.selected);
 			return;
 		}
-		if (matchesKey(data, Key.up) || data === "k") {
+		if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
 			return;
 		}
-		if (matchesKey(data, Key.down) || data === "j") {
+		if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
 			this.scrollOffset += 1;
 			return;
 		}
@@ -211,43 +202,9 @@ class DiffApprovalComponent {
 			this.scrollOffset += this.pageSize;
 			return;
 		}
-		if (data.length === 1) {
-			const normalized = data.toLowerCase();
-			if (normalized === "y" || normalized === "a") this.done({ approved: true });
-			else if (normalized === "n" || normalized === "d") this.deny();
-			else if (normalized === "c" || normalized === "r" || normalized === "e") this.startFeedback();
-		}
-	}
-
-	private submitSelectedChoice(): void {
-		if (this.selected === "allow") {
-			this.done({ approved: true });
-			return;
-		}
-		if (this.selected === "deny") {
-			this.deny();
-			return;
-		}
-		if (this.getNormalizedFeedback()) {
-			this.deny();
-			return;
-		}
-		this.startFeedback();
-	}
-
-	private startFeedback(): void {
-		this.selected = "changes";
-		this.editingFeedback = true;
-		this.feedbackCursor = this.feedback.length;
-	}
-
-	private deny(): void {
-		const feedback = this.getNormalizedFeedback();
-		this.done(feedback ? { approved: false, feedback } : { approved: false });
-	}
-
-	private getNormalizedFeedback(): string {
-		return this.feedback.trim().replace(/\s+/g, " ");
+		if (matchesKey(data, "y") || matchesKey(data, "a")) this.done("allow");
+		else if (matchesKey(data, "n") || matchesKey(data, "d")) this.done("deny");
+		else if (matchesKey(data, "c") || matchesKey(data, "r") || matchesKey(data, "e")) this.done("changes");
 	}
 
 	private previousChoice(choice: ApprovalChoice): ApprovalChoice {
@@ -262,64 +219,14 @@ class DiffApprovalComponent {
 		return "allow";
 	}
 
-	private handleFeedbackInput(data: string): void {
-		if (matchesKey(data, Key.escape)) {
-			this.editingFeedback = false;
-			return;
-		}
-		if (matchesKey(data, Key.ctrl("c"))) {
-			this.deny();
-			return;
-		}
-		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.deny();
-			return;
-		}
-		if (matchesKey(data, Key.left)) {
-			this.feedbackCursor = Math.max(0, this.feedbackCursor - 1);
-			return;
-		}
-		if (matchesKey(data, Key.right)) {
-			this.feedbackCursor = Math.min(this.feedback.length, this.feedbackCursor + 1);
-			return;
-		}
-		if (matchesKey(data, Key.home)) {
-			this.feedbackCursor = 0;
-			return;
-		}
-		if (matchesKey(data, Key.end)) {
-			this.feedbackCursor = this.feedback.length;
-			return;
-		}
-		if (matchesKey(data, Key.backspace)) {
-			if (this.feedbackCursor > 0) {
-				this.feedback = this.feedback.slice(0, this.feedbackCursor - 1) + this.feedback.slice(this.feedbackCursor);
-				this.feedbackCursor--;
-			}
-			return;
-		}
-		if (matchesKey(data, Key.delete)) {
-			if (this.feedbackCursor < this.feedback.length) {
-				this.feedback = this.feedback.slice(0, this.feedbackCursor) + this.feedback.slice(this.feedbackCursor + 1);
-			}
-			return;
-		}
-		if (data.length === 1 && data.charCodeAt(0) >= 32 && this.feedback.length < DIFF_FEEDBACK_MAX_CHARS) {
-			this.feedback = this.feedback.slice(0, this.feedbackCursor) + data + this.feedback.slice(this.feedbackCursor);
-			this.feedbackCursor++;
-		}
-	}
-
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const body = this.renderBody(safeWidth);
 		const headerLines = this.renderHeader(safeWidth).map((line) => truncateToWidth(line, safeWidth));
-		const feedbackLines = this.renderFeedbackLines(safeWidth);
-		const feedbackChromeLines = feedbackLines.length > 0 ? feedbackLines.length + 1 : 0;
 		const buttonLines = [this.renderButtons(safeWidth)];
 		const helpLines = [truncateToWidth(this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • c request changes • enter confirm • esc deny"), safeWidth)];
 		const maxTotalLines = this.getMaxTotalLines();
-		const baseChromeLines = headerLines.length + 1 + feedbackChromeLines + 1 + buttonLines.length + helpLines.length;
+		const baseChromeLines = headerLines.length + 1 + 1 + buttonLines.length + helpLines.length;
 		let visibleBodyLineCount = Math.max(
 			DIFF_PREVIEW_MIN_BODY_LINES,
 			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines),
@@ -349,9 +256,6 @@ class DiffApprovalComponent {
 					safeWidth,
 				),
 			);
-		}
-		if (feedbackLines.length > 0) {
-			lines.push("", ...feedbackLines);
 		}
 		lines.push("", ...buttonLines, ...helpLines);
 		return lines.map((line) => (visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth) : line));
@@ -432,21 +336,6 @@ class DiffApprovalComponent {
 	private getHighlightedNew(): string[] {
 		this.highlightedNew ??= highlightDiffSourceLines(this.preview.newLines, this.preview.language);
 		return this.highlightedNew;
-	}
-
-	private renderFeedbackLines(width: number): string[] {
-		if (!this.editingFeedback && !this.feedback) return [];
-		const label = this.editingFeedback ? "Change request: " : "Requested changes: ";
-		const hint = this.editingFeedback ? this.theme.fg("dim", "  Enter sends • Esc keeps editing off") : "";
-		return [truncateToWidth(`${this.theme.fg("muted", label)}${this.renderFeedbackText()}${hint}`, width)];
-	}
-
-	private renderFeedbackText(): string {
-		if (!this.editingFeedback) return this.feedback || this.theme.fg("dim", "(none)");
-		const before = this.feedback.slice(0, this.feedbackCursor);
-		const cursorChar = this.feedbackCursor < this.feedback.length ? this.feedback[this.feedbackCursor] : " ";
-		const after = this.feedback.slice(this.feedbackCursor + 1);
-		return `${before}\x1b[7m${cursorChar}\x1b[27m${after}`;
 	}
 
 	private renderButtons(width: number): string {
@@ -629,7 +518,7 @@ async function requestDangerousCommandApproval(ctx: ExtensionContext, command: s
 }
 
 async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<DiffApprovalResult> {
-	return await ctx.ui.custom<DiffApprovalResult>((tui, theme, _keybindings, done) => {
+	const choice = await ctx.ui.custom<ApprovalChoice>((tui, theme, _keybindings, done) => {
 		const component = new DiffApprovalComponent(preview, theme, done, () => tui.terminal.rows);
 		return {
 			render: (width: number) => component.render(width),
@@ -640,6 +529,14 @@ async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview):
 			},
 		};
 	});
+
+	if (choice === "allow") return { approved: true };
+	if (choice === "changes") {
+		const feedback = await ctx.ui.editor(`What should change in ${preview.path}?`, "");
+		const normalized = normalizeFeedback(feedback ?? "");
+		return normalized ? { approved: false, feedback: normalized } : { approved: false };
+	}
+	return { approved: false };
 }
 
 function buildWriteDiffPreview(input: { path: string; content: string }, cwd: string): DiffPreview {
@@ -1045,6 +942,10 @@ function getErrorCode(error: unknown): string | undefined {
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeFeedback(feedback: string): string {
+	return feedback.trim().replace(/\s+/g, " ");
 }
 
 function formatChangeRequest(feedback: string | undefined): string {
