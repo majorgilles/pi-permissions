@@ -108,6 +108,8 @@ In `ask` mode, `write` and `edit` show a read-only Claude-Code-style diff with t
 
 Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, Enter to confirm, and Esc to deny. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
 
+The diff approval view adapts to the current terminal height. In short tmux panes it shows fewer diff rows and keeps the header/buttons bounded, reducing full-screen redraws and pane flicker.
+
 In `auto` mode, `write` and `edit` are accepted automatically.
 
 ## Preferences
@@ -210,6 +212,7 @@ Write/edit diff approval is read-only and does not use vim mode.
 - Dangerous bash classification is heuristic; shell syntax can hide side effects.
 - Reads/writes are intentionally unrestricted in auto mode.
 - Write/edit diff approval is line-based; very large diffs may be shown as a full replacement preview.
+- Short terminal panes show a smaller scrollable diff body to avoid excessive redraws.
 - Non-interactive mode blocks approval-required actions rather than prompting.
 
 ## Checking

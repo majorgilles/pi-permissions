@@ -15,7 +15,11 @@ const GLOBAL_CONFIG = path.join(os.homedir(), ".pi", "agent", "permissions.json"
 const PROJECT_CONFIG = ".pi/permissions.json";
 
 const DIFF_CONTEXT_LINES = 4;
-const DIFF_PREVIEW_VISIBLE_LINES = 18;
+const DIFF_PREVIEW_MAX_BODY_LINES = 18;
+const DIFF_PREVIEW_MAX_TOTAL_LINES = 26;
+const DIFF_PREVIEW_MIN_TOTAL_LINES = 8;
+const DIFF_PREVIEW_TERMINAL_MARGIN_LINES = 6;
+const DIFF_PREVIEW_MIN_BODY_LINES = 1;
 const DIFF_CELL_THRESHOLD = 4_000_000;
 
 type PermissionMode = "ask" | "auto";
@@ -149,6 +153,7 @@ class VimEditor extends CustomEditor {
 class DiffApprovalComponent {
 	private selected: ApprovalChoice = "allow";
 	private scrollOffset = 0;
+	private pageSize = DIFF_PREVIEW_MAX_BODY_LINES;
 	private highlightedOld: string[] | undefined;
 	private highlightedNew: string[] | undefined;
 
@@ -156,6 +161,7 @@ class DiffApprovalComponent {
 		private readonly preview: DiffPreview,
 		private readonly theme: PermissionTheme,
 		private readonly done: (approved: boolean) => void,
+		private readonly getTerminalRows: () => number,
 	) {}
 
 	handleInput(data: string): void {
@@ -188,11 +194,11 @@ class DiffApprovalComponent {
 			return;
 		}
 		if (matchesKey(data, Key.pageUp)) {
-			this.scrollOffset = Math.max(0, this.scrollOffset - DIFF_PREVIEW_VISIBLE_LINES);
+			this.scrollOffset = Math.max(0, this.scrollOffset - this.pageSize);
 			return;
 		}
 		if (matchesKey(data, Key.pageDown)) {
-			this.scrollOffset += DIFF_PREVIEW_VISIBLE_LINES;
+			this.scrollOffset += this.pageSize;
 			return;
 		}
 		if (data.length === 1) {
@@ -205,24 +211,50 @@ class DiffApprovalComponent {
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const body = this.renderBody(safeWidth);
-		const maxScroll = Math.max(0, body.length - DIFF_PREVIEW_VISIBLE_LINES);
+		const headerLines = this.renderHeader(safeWidth).map((line) => truncateToWidth(line, safeWidth));
+		const buttonLines = [this.renderButtons(safeWidth)];
+		const helpLines = [truncateToWidth(this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"), safeWidth)];
+		const maxTotalLines = this.getMaxTotalLines();
+		const baseChromeLines = headerLines.length + 1 + 1 + buttonLines.length + helpLines.length;
+		let visibleBodyLineCount = Math.max(
+			DIFF_PREVIEW_MIN_BODY_LINES,
+			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines),
+		);
+		let needsScroll = body.length > visibleBodyLineCount;
+		visibleBodyLineCount = Math.max(
+			DIFF_PREVIEW_MIN_BODY_LINES,
+			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines - (needsScroll ? 1 : 0)),
+		);
+		needsScroll = body.length > visibleBodyLineCount;
+		this.pageSize = visibleBodyLineCount;
+		const maxScroll = Math.max(0, body.length - visibleBodyLineCount);
 		this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
-		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES);
+		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + visibleBodyLineCount);
 		const lines = [
-			...this.renderHeader(safeWidth),
+			...headerLines,
 			"",
 			...visibleBody,
 		];
-		if (body.length > DIFF_PREVIEW_VISIBLE_LINES) {
+		if (needsScroll) {
 			lines.push(
-				this.theme.fg(
-					"dim",
-					`Showing ${this.scrollOffset + 1}-${Math.min(this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES, body.length)} of ${body.length} diff lines`,
+				truncateToWidth(
+					this.theme.fg(
+						"dim",
+						`${this.scrollOffset + 1}-${Math.min(this.scrollOffset + visibleBodyLineCount, body.length)} / ${body.length} diff lines`,
+					),
+					safeWidth,
 				),
 			);
 		}
-		lines.push("", this.renderButtons(safeWidth), this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"));
-		return lines.flatMap((line) => wrapTextWithAnsi(line, safeWidth));
+		lines.push("", ...buttonLines, ...helpLines);
+		return lines.map((line) => (visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth) : line));
+	}
+
+	private getMaxTotalLines(): number {
+		const rows = Math.max(1, this.getTerminalRows());
+		const available = rows - DIFF_PREVIEW_TERMINAL_MARGIN_LINES;
+		if (available < DIFF_PREVIEW_MIN_TOTAL_LINES) return Math.max(1, available);
+		return Math.min(DIFF_PREVIEW_MAX_TOTAL_LINES, available);
 	}
 
 	invalidate(): void {
@@ -472,7 +504,7 @@ async function requestDangerousCommandApproval(ctx: ExtensionContext, command: s
 
 async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
 	return await ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
-		const component = new DiffApprovalComponent(preview, theme, done);
+		const component = new DiffApprovalComponent(preview, theme, done, () => tui.terminal.rows);
 		return {
 			render: (width: number) => component.render(width),
 			invalidate: () => component.invalidate(),
