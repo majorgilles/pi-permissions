@@ -1,8 +1,13 @@
 # Pi Permissions Extension
 
-Claude-Code-like permission gates for pi tool calls.
+Simplified auto/ask guardrails for pi tool calls.
 
-This extension lets read-only inspection run without prompts, blocks sensitive file access, and defaults to Claude-Code-like auto approval for safe tool calls while dangerous commands still prompt or block. A manual `ask` mode is available for sessions where you want mutating tool calls to require approval.
+The extension now has only two permission behaviors:
+
+- dangerous bash commands are always flagged in both modes
+- `ask` mode shows read-only diffs for `write` and `edit` with Allow/Deny controls
+
+Granular session/project/global allowlists, custom-tool approvals, bash prefix approvals, path deny/sensitive rules, and persisted permission grants have been removed.
 
 ## Install
 
@@ -19,10 +24,10 @@ pi -e git:github.com/majorgilles/pi-permissions
 ## Files
 
 - Package extension entrypoint: `index.ts`
-- Global config: `~/.pi/agent/permissions.json`
-- Project config: `.pi/permissions.json`
+- Optional global preferences: `~/.pi/agent/permissions.json`
+- Optional project preferences: `.pi/permissions.json`
 
-Project config is additive: project rules are merged with global rules.
+Preference files only configure the default mode and optional vim editor setting. Legacy granular permission fields are ignored.
 
 ## Loading
 
@@ -34,13 +39,13 @@ If pi is already running, use:
 /reload
 ```
 
-When loaded, the footer/status area shows the active mode. By default:
+When loaded, the footer/status area shows the active mode:
 
 ```text
 permissions: auto
 ```
 
-or, when manual approval mode is enabled:
+or:
 
 ```text
 permissions: ask
@@ -48,8 +53,8 @@ permissions: ask
 
 ## Modes
 
-- `auto` (default): Claude-Code-like full auto approval. Non-sensitive writes/edits, non-denied non-dangerous bash commands (including read-only bash), and custom tools are accepted automatically. Dangerous bash commands still require approval or are blocked, and sensitive/denied paths remain blocked.
-- `ask`: manual permission-gate behavior. Recognized read-only bash commands are accepted automatically; mutating or unknown bash/custom tools prompt unless allowlisted, and writes/edits show a read-only Claude-Code-style diff approval UI.
+- `auto` (default): reads, writes/edits, non-dangerous bash commands, and custom tools are allowed automatically. Dangerous bash commands still prompt or block.
+- `ask`: reads, non-dangerous bash commands, and custom tools are allowed automatically. `write` and `edit` show a read-only diff with Allow/Deny controls. Dangerous bash commands still prompt or block.
 
 Toggle for the current session:
 
@@ -65,41 +70,26 @@ or:
 /permissions-mode ask
 ```
 
-Auto is the default. To force manual approvals by default, set top-level config field `"mode": "ask"`.
+To choose the startup mode by preference, set top-level config field `"mode": "ask"` or `"mode": "auto"`.
 
 ## Default behavior
 
 | Tool | Ask mode | Auto mode |
 | --- | --- | --- |
-| `read` | Allowed unless the path matches `paths.denyRead` or `paths.sensitive`. | Same. |
-| `bash` | Recognized read-only commands are allowed without prompting. Mutating or unknown commands prompt unless they match exact/session/project/global allow rules. Dangerous commands still prompt/block. | Automatically allowed unless denied or dangerous. Dangerous commands still prompt/block. |
-| `write` | Shows a read-only diff between the current file and proposed content, then asks Allow/Deny. | Automatically allowed unless the path is denied/sensitive. |
-| `edit` | Shows a read-only diff of the proposed replacements, then asks Allow/Deny. | Automatically allowed unless the path is denied/sensitive. |
-| unknown/custom tools | Prompt by default, with limited persistence options. | Automatically allowed. |
-| no UI | Blocks anything that requires approval. | Auto-approved operations proceed; danger prompts still block because there is no UI. |
-
-Read-only built-ins `grep`, `find`, and `ls` are treated as known built-ins rather than unknown custom tools. Common read-only bash commands (`pwd`, `ls`, `cat`, `rg`, `grep`, `find`, `git status`, `git diff`, etc.) are also auto-allowed in every mode when they do not use output redirection or unsafe options such as `find -exec`/`-delete`.
-
-## Bash approvals
-
-For a bash command that requires approval, the prompt offers:
-
-- Deny
-- Allow once
-- Allow for this session
-- Allow this exact command for this project
-- Allow this command prefix for this project
-- Allow this exact command globally
-
-The extension intentionally does **not** offer global prefix approval from the prompt.
+| `read` | Allowed. | Allowed. |
+| `bash` | Allowed unless classified as dangerous. Dangerous commands prompt/block. | Allowed unless classified as dangerous. Dangerous commands prompt/block. |
+| `write` | Shows a read-only diff, then asks Allow/Deny. | Allowed. |
+| `edit` | Shows a read-only diff of the proposed replacements, then asks Allow/Deny. | Allowed. |
+| unknown/custom tools | Allowed. | Allowed. |
+| no UI | Blocks approval-required dangerous bash and ask-mode write/edit diffs. | Blocks approval-required dangerous bash; otherwise allows. |
 
 ## Dangerous commands
 
-Deny and danger checks take precedence over allow rules.
+Danger checks run before mode behavior.
 
 The extension blocks obviously catastrophic recursive deletes, such as broad `rm -rf` against `/`, `~`, `.`, or `*`.
 
-It requires extra confirmation for risky patterns such as:
+It requires approval for risky patterns such as:
 
 - recursive deletes like `rm -rf path`
 - `sudo` / `su`
@@ -114,21 +104,21 @@ These checks are heuristic and should not be treated as a complete sandbox.
 
 ## Write/edit diff approvals
 
-In `ask` mode, `write` and `edit` no longer open editable review buffers. Instead they show a read-only Claude-Code-style diff with colored additions/removals and syntax highlighting for recognized source-code file types.
+In `ask` mode, `write` and `edit` show a read-only Claude-Code-style diff with transparent-style red backgrounds for deletions, transparent-style green backgrounds for additions, and syntax highlighting for recognized source-code file types.
 
 Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, and Enter to choose. Choosing Deny (including via Esc, `n`, or `d`) opens a text input where you can tell pi what to do instead; that feedback is returned to the model as the blocked tool result. Submit blank to deny without feedback, or press Esc in the text input to return to the diff review. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
 
-In `auto` mode, `write` and `edit` are accepted automatically unless the target path matches `paths.denyWrite` or `paths.sensitive`.
+In `auto` mode, `write` and `edit` are accepted automatically.
 
-## Config
+## Preferences
 
-Global config lives at:
+Global preferences live at:
 
 ```text
 ~/.pi/agent/permissions.json
 ```
 
-Project config lives at:
+Project preferences live at:
 
 ```text
 .pi/permissions.json
@@ -138,50 +128,20 @@ Example:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "mode": "auto",
-  "bash": {
-    "allowExact": [],
-    "allowPrefixes": [],
-    "denyPatterns": []
-  },
-  "tools": {
-    "allow": []
-  },
-  "paths": {
-    "denyRead": [],
-    "denyWrite": [],
-    "sensitive": [
-      ".env",
-      ".env.*",
-      "**/.env",
-      "**/.env.*",
-      "**/*secret*",
-      "**/*credential*",
-      "**/*token*",
-      "**/id_rsa",
-      "**/id_ed25519",
-      "**/*.pem",
-      "**/*.key"
-    ]
-  },
   "mainEditor": {
     "vimMode": false
   }
 }
 ```
 
-### Config fields
+### Preference fields
 
 - `mode`: `"ask"` or `"auto"`; default startup mode (`"auto"` unless configured otherwise). Session commands can override it until reload/restart.
-- `bash.allowExact`: exact commands allowed without prompting. Usually only needed for commands you intentionally want to trust despite not being classified as read-only.
-- `bash.allowPrefixes`: command prefixes allowed without prompting. Prefer narrow prefixes because these bypass ask-mode prompts.
-- `bash.denyPatterns`: regular expressions checked against commands before allow rules.
-- `tools.allow`: custom tool names allowed without prompting.
-- `paths.denyRead`: path globs blocked for reads.
-- `paths.denyWrite`: path globs blocked for writes/edits.
-- `paths.sensitive`: path globs blocked for both reads and writes/edits.
 - `mainEditor.vimMode`: replace pi's main input editor with a simple vim-style modal editor.
+
+Legacy fields such as `bash.allowExact`, `bash.allowPrefixes`, `bash.denyPatterns`, `tools.allow`, `paths.denyRead`, `paths.denyWrite`, and `paths.sensitive` are intentionally ignored.
 
 ## Admin commands
 
@@ -189,13 +149,13 @@ Example:
 /permissions
 ```
 
-Show the effective policy summary.
+Show the effective simplified guardrail summary.
 
 ```text
 /permissions-auto [on|off|toggle]
 ```
 
-Toggle Claude-Code-like auto approval for the current session.
+Toggle auto/ask mode for the current session.
 
 ```text
 /permissions-mode [ask|auto]
@@ -207,25 +167,25 @@ Show or set the current session permission mode.
 /permissions-edit global
 ```
 
-Open `~/.pi/agent/permissions.json` in an editor and reload it after saving valid JSON.
+Open `~/.pi/agent/permissions.json` in an editor and reload it after saving valid JSON preferences.
 
 ```text
 /permissions-edit project
 ```
 
-Open `.pi/permissions.json` for the current working directory and reload it after saving valid JSON.
+Open `.pi/permissions.json` for the current working directory and reload it after saving valid JSON preferences.
 
 ```text
 /permissions-reload
 ```
 
-Reload global and project configs without restarting pi.
+Reload global and project preferences without restarting pi.
 
 ## Vim mode
 
 Vim bindings are off by default.
 
-Set `mainEditor.vimMode` to `true` in config:
+Set `mainEditor.vimMode` to `true` in preferences:
 
 ```json
 {
@@ -247,8 +207,8 @@ Write/edit diff approval is read-only and does not use vim mode.
 ## Limitations
 
 - This is a guardrail, not a sandbox. Extensions run with your user permissions.
-- Bash parsing/read-only classification is heuristic; shell syntax can hide side effects, and unknown commands may still prompt in `ask` mode.
-- Path glob matching is intentionally simple.
+- Dangerous bash classification is heuristic; shell syntax can hide side effects.
+- Reads/writes are intentionally unrestricted in auto mode.
 - Write/edit diff approval is line-based; very large diffs may be shown as a full replacement preview.
 - Non-interactive mode blocks approval-required actions rather than prompting.
 
@@ -260,7 +220,7 @@ Validate package contents with:
 npm pack --dry-run
 ```
 
-After changing the extension code or config, reload pi with:
+After changing the extension code or preferences, reload pi with:
 
 ```text
 /reload
@@ -272,4 +232,8 @@ or use:
 /permissions-reload
 ```
 
-for config-only changes.
+for preference-only changes.
+
+## License
+
+This source is available under the [PolyForm Noncommercial License 1.0.0](./LICENSE). You may download, copy, modify, and share it for noncommercial purposes. Commercial use is not permitted without separate written permission.
