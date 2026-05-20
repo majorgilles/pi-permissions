@@ -54,7 +54,7 @@ permissions: ask
 ## Modes
 
 - `auto` (default): reads, writes/edits, non-dangerous bash commands, and custom tools are allowed automatically. Dangerous bash commands still prompt or block.
-- `ask`: reads, non-dangerous bash commands, and custom tools are allowed automatically. `write` and `edit` show a read-only diff with Allow/Deny controls. Dangerous bash commands still prompt or block.
+- `ask`: reads, non-dangerous bash commands, and custom tools are allowed automatically. `write` and `edit` show a read-only diff with Allow/Request changes/Deny controls. Dangerous bash commands still prompt or block.
 
 Toggle for the current session:
 
@@ -78,8 +78,8 @@ To choose the startup mode by preference, set top-level config field `"mode": "a
 | --- | --- | --- |
 | `read` | Allowed. | Allowed. |
 | `bash` | Allowed unless classified as dangerous. Dangerous commands prompt/block. | Allowed unless classified as dangerous. Dangerous commands prompt/block. |
-| `write` | Shows a read-only diff, then asks Allow/Deny. | Allowed. |
-| `edit` | Shows a read-only diff of the proposed replacements, then asks Allow/Deny. | Allowed. |
+| `write` | Shows a read-only diff, then asks Allow/Request changes/Deny. | Allowed. |
+| `edit` | Shows a read-only diff of the proposed replacements, then asks Allow/Request changes/Deny. | Allowed. |
 | unknown/custom tools | Allowed. | Allowed. |
 | no UI | Blocks approval-required dangerous bash and ask-mode write/edit diffs. | Blocks approval-required dangerous bash; otherwise allows. |
 
@@ -106,7 +106,9 @@ These checks are heuristic and should not be treated as a complete sandbox.
 
 In `ask` mode, `write` and `edit` show a read-only Claude-Code-style diff with transparent-style red backgrounds for deletions, transparent-style green backgrounds for additions, and syntax highlighting for recognized source-code file types.
 
-Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, Enter to confirm, and Esc to deny. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
+Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Request changes/Deny, Enter to confirm, and Esc to deny. Press `c`, `r`, or `e` (or choose Request changes) to open a text editor for change-request feedback. The feedback is sent back to the agent as the blocked tool reason so the agent can revise instead of only seeing a generic denial. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
+
+The diff approval view adapts to the current terminal height. In short tmux panes it shows fewer diff rows and keeps the header/buttons bounded, reducing full-screen redraws and pane flicker.
 
 In `auto` mode, `write` and `edit` are accepted automatically.
 
@@ -210,6 +212,8 @@ Write/edit diff approval is read-only and does not use vim mode.
 - Dangerous bash classification is heuristic; shell syntax can hide side effects.
 - Reads/writes are intentionally unrestricted in auto mode.
 - Write/edit diff approval is line-based; very large diffs may be shown as a full replacement preview.
+- Change requests are sent as denial feedback for the agent to act on; they do not edit the pending tool call in place.
+- Short terminal panes show a smaller scrollable diff body to avoid excessive redraws.
 - Non-interactive mode blocks approval-required actions rather than prompting.
 
 ## Checking

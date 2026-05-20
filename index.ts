@@ -15,14 +15,19 @@ const GLOBAL_CONFIG = path.join(os.homedir(), ".pi", "agent", "permissions.json"
 const PROJECT_CONFIG = ".pi/permissions.json";
 
 const DIFF_CONTEXT_LINES = 4;
-const DIFF_PREVIEW_VISIBLE_LINES = 18;
+const DIFF_PREVIEW_MAX_BODY_LINES = 18;
+const DIFF_PREVIEW_MAX_TOTAL_LINES = 26;
+const DIFF_PREVIEW_MIN_TOTAL_LINES = 8;
+const DIFF_PREVIEW_TERMINAL_MARGIN_LINES = 6;
+const DIFF_PREVIEW_MIN_BODY_LINES = 1;
 const DIFF_CELL_THRESHOLD = 4_000_000;
 
 type PermissionMode = "ask" | "auto";
 type DiffTool = "write" | "edit";
 type DiffLineKind = "added" | "removed" | "context" | "skip";
 type PermissionTheme = ExtensionContext["ui"]["theme"];
-type ApprovalChoice = "allow" | "deny";
+type ApprovalChoice = "allow" | "changes" | "deny";
+type DiffApprovalResult = { approved: true } | { approved: false; feedback?: string };
 
 type PermissionConfig = {
 	version?: number;
@@ -149,80 +154,118 @@ class VimEditor extends CustomEditor {
 class DiffApprovalComponent {
 	private selected: ApprovalChoice = "allow";
 	private scrollOffset = 0;
+	private pageSize = DIFF_PREVIEW_MAX_BODY_LINES;
 	private highlightedOld: string[] | undefined;
 	private highlightedNew: string[] | undefined;
 
 	constructor(
 		private readonly preview: DiffPreview,
 		private readonly theme: PermissionTheme,
-		private readonly done: (approved: boolean) => void,
+		private readonly done: (choice: ApprovalChoice) => void,
+		private readonly getTerminalRows: () => number,
 	) {}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-			this.done(false);
+			this.done("deny");
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.done(this.selected === "allow");
+			this.done(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.tab) || matchesKey(data, Key.space)) {
-			this.selected = this.selected === "allow" ? "deny" : "allow";
+			this.selected = this.nextChoice(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.left)) {
-			this.selected = "allow";
+			this.selected = this.previousChoice(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.right)) {
-			this.selected = "deny";
+			this.selected = this.nextChoice(this.selected);
 			return;
 		}
-		if (matchesKey(data, Key.up) || data === "k") {
+		if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
 			return;
 		}
-		if (matchesKey(data, Key.down) || data === "j") {
+		if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
 			this.scrollOffset += 1;
 			return;
 		}
 		if (matchesKey(data, Key.pageUp)) {
-			this.scrollOffset = Math.max(0, this.scrollOffset - DIFF_PREVIEW_VISIBLE_LINES);
+			this.scrollOffset = Math.max(0, this.scrollOffset - this.pageSize);
 			return;
 		}
 		if (matchesKey(data, Key.pageDown)) {
-			this.scrollOffset += DIFF_PREVIEW_VISIBLE_LINES;
+			this.scrollOffset += this.pageSize;
 			return;
 		}
-		if (data.length === 1) {
-			const normalized = data.toLowerCase();
-			if (normalized === "y" || normalized === "a") this.done(true);
-			else if (normalized === "n" || normalized === "d") this.done(false);
-		}
+		if (matchesKey(data, "y") || matchesKey(data, "a")) this.done("allow");
+		else if (matchesKey(data, "n") || matchesKey(data, "d")) this.done("deny");
+		else if (matchesKey(data, "c") || matchesKey(data, "r") || matchesKey(data, "e")) this.done("changes");
+	}
+
+	private previousChoice(choice: ApprovalChoice): ApprovalChoice {
+		if (choice === "allow") return "deny";
+		if (choice === "changes") return "allow";
+		return "changes";
+	}
+
+	private nextChoice(choice: ApprovalChoice): ApprovalChoice {
+		if (choice === "allow") return "changes";
+		if (choice === "changes") return "deny";
+		return "allow";
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const body = this.renderBody(safeWidth);
-		const maxScroll = Math.max(0, body.length - DIFF_PREVIEW_VISIBLE_LINES);
+		const headerLines = this.renderHeader(safeWidth).map((line) => truncateToWidth(line, safeWidth));
+		const buttonLines = [this.renderButtons(safeWidth)];
+		const helpLines = [truncateToWidth(this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • c request changes • enter confirm • esc deny"), safeWidth)];
+		const maxTotalLines = this.getMaxTotalLines();
+		const baseChromeLines = headerLines.length + 1 + 1 + buttonLines.length + helpLines.length;
+		let visibleBodyLineCount = Math.max(
+			DIFF_PREVIEW_MIN_BODY_LINES,
+			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines),
+		);
+		let needsScroll = body.length > visibleBodyLineCount;
+		visibleBodyLineCount = Math.max(
+			DIFF_PREVIEW_MIN_BODY_LINES,
+			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines - (needsScroll ? 1 : 0)),
+		);
+		needsScroll = body.length > visibleBodyLineCount;
+		this.pageSize = visibleBodyLineCount;
+		const maxScroll = Math.max(0, body.length - visibleBodyLineCount);
 		this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
-		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES);
+		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + visibleBodyLineCount);
 		const lines = [
-			...this.renderHeader(safeWidth),
+			...headerLines,
 			"",
 			...visibleBody,
 		];
-		if (body.length > DIFF_PREVIEW_VISIBLE_LINES) {
+		if (needsScroll) {
 			lines.push(
-				this.theme.fg(
-					"dim",
-					`Showing ${this.scrollOffset + 1}-${Math.min(this.scrollOffset + DIFF_PREVIEW_VISIBLE_LINES, body.length)} of ${body.length} diff lines`,
+				truncateToWidth(
+					this.theme.fg(
+						"dim",
+						`${this.scrollOffset + 1}-${Math.min(this.scrollOffset + visibleBodyLineCount, body.length)} / ${body.length} diff lines`,
+					),
+					safeWidth,
 				),
 			);
 		}
-		lines.push("", this.renderButtons(safeWidth), this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"));
-		return lines.flatMap((line) => wrapTextWithAnsi(line, safeWidth));
+		lines.push("", ...buttonLines, ...helpLines);
+		return lines.map((line) => (visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth) : line));
+	}
+
+	private getMaxTotalLines(): number {
+		const rows = Math.max(1, this.getTerminalRows());
+		const available = rows - DIFF_PREVIEW_TERMINAL_MARGIN_LINES;
+		if (available < DIFF_PREVIEW_MIN_TOTAL_LINES) return Math.max(1, available);
+		return Math.min(DIFF_PREVIEW_MAX_TOTAL_LINES, available);
 	}
 
 	invalidate(): void {
@@ -297,17 +340,21 @@ class DiffApprovalComponent {
 
 	private renderButtons(width: number): string {
 		const allow = this.renderButton("allow", "Allow");
+		const changes = this.renderButton("changes", "Request changes");
 		const deny = this.renderButton("deny", "Deny");
-		return truncateToWidth(`${allow} ${deny}`, width);
+		return truncateToWidth(`${allow} ${changes} ${deny}`, width);
 	}
 
 	private renderButton(choice: ApprovalChoice, label: string): string {
 		const base = ` ${label} `;
-		if (this.selected !== choice) {
-			return choice === "allow" ? this.theme.fg("success", base) : this.theme.fg("error", base);
-		}
-		const colored = choice === "allow" ? this.theme.fg("success", this.theme.bold(base)) : this.theme.fg("error", this.theme.bold(base));
-		return this.theme.bg("selectedBg", colored);
+		const colored = this.colorChoice(choice, this.selected === choice ? this.theme.bold(base) : base);
+		return this.selected === choice ? this.theme.bg("selectedBg", colored) : colored;
+	}
+
+	private colorChoice(choice: ApprovalChoice, text: string): string {
+		if (choice === "allow") return this.theme.fg("success", text);
+		if (choice === "changes") return this.theme.fg("warning", text);
+		return this.theme.fg("error", text);
 	}
 }
 
@@ -445,8 +492,8 @@ async function handleWrite(input: { path: string; content: string }, ctx: Extens
 		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
+	const result = await requestDiffApproval(ctx, preview);
+	if (!result.approved) return { block: true, reason: `Denied write after diff review: ${input.path}${formatChangeRequest(result.feedback)}` };
 }
 
 async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
@@ -460,8 +507,8 @@ async function handleEdit(input: { path: string; edits: Array<{ oldText: string;
 		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
+	const result = await requestDiffApproval(ctx, preview);
+	if (!result.approved) return { block: true, reason: `Denied edit after diff review: ${input.path}${formatChangeRequest(result.feedback)}` };
 }
 
 async function requestDangerousCommandApproval(ctx: ExtensionContext, command: string, reason: string | undefined): Promise<boolean> {
@@ -470,9 +517,9 @@ async function requestDangerousCommandApproval(ctx: ExtensionContext, command: s
 	return choice === "Allow";
 }
 
-async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
-	return await ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
-		const component = new DiffApprovalComponent(preview, theme, done);
+async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<DiffApprovalResult> {
+	const choice = await ctx.ui.custom<ApprovalChoice>((tui, theme, _keybindings, done) => {
+		const component = new DiffApprovalComponent(preview, theme, done, () => tui.terminal.rows);
 		return {
 			render: (width: number) => component.render(width),
 			invalidate: () => component.invalidate(),
@@ -482,6 +529,14 @@ async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview):
 			},
 		};
 	});
+
+	if (choice === "allow") return { approved: true };
+	if (choice === "changes") {
+		const feedback = await ctx.ui.editor(`What should change in ${preview.path}?`, "");
+		const normalized = normalizeFeedback(feedback ?? "");
+		return normalized ? { approved: false, feedback: normalized } : { approved: false };
+	}
+	return { approved: false };
 }
 
 function buildWriteDiffPreview(input: { path: string; content: string }, cwd: string): DiffPreview {
@@ -887,6 +942,14 @@ function getErrorCode(error: unknown): string | undefined {
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeFeedback(feedback: string): string {
+	return feedback.trim().replace(/\s+/g, " ");
+}
+
+function formatChangeRequest(feedback: string | undefined): string {
+	return feedback ? `; user requested changes: ${feedback}` : "";
 }
 
 function resolveForPolicy(filePath: string, cwd: string): string {
