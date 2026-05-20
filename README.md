@@ -116,7 +116,7 @@ These checks are heuristic and should not be treated as a complete sandbox.
 
 In `ask` mode, `write` and `edit` no longer open editable review buffers. Instead they show a read-only Claude-Code-style diff with colored additions/removals and syntax highlighting for recognized source-code file types.
 
-Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, and Enter to choose. Choosing Deny (including via Esc, `n`, or `d`) opens a confirmation prompt; cancel that prompt to return to the diff review. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
+Use arrow keys or `j`/`k` to scroll the diff, left/right or Tab to choose Allow/Deny, and Enter to choose. Choosing Deny (including via Esc, `n`, or `d`) opens a text input where you can tell pi what to do instead; that feedback is returned to the model as the blocked tool result. Submit blank to deny without feedback, or press Esc in the text input to return to the diff review. The proposed output cannot be edited in the approval UI; approving runs the original tool call exactly as produced.
 
 In `auto` mode, `write` and `edit` are accepted automatically unless the target path matches `paths.denyWrite` or `paths.sensitive`.
 
