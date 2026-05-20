@@ -23,6 +23,7 @@ type DiffTool = "write" | "edit";
 type DiffLineKind = "added" | "removed" | "context" | "skip";
 type PermissionTheme = ExtensionContext["ui"]["theme"];
 type ApprovalChoice = "allow" | "deny";
+type DiffApprovalDecision = { approved: true } | { approved: false; feedback?: string };
 
 type PermissionConfig = {
 	version?: number;
@@ -155,16 +156,16 @@ class DiffApprovalComponent {
 	constructor(
 		private readonly preview: DiffPreview,
 		private readonly theme: PermissionTheme,
-		private readonly done: (approved: boolean) => void,
+		private readonly done: (choice: ApprovalChoice) => void,
 	) {}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-			this.done(false);
+			this.done("deny");
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.done(this.selected === "allow");
+			this.done(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.tab) || matchesKey(data, Key.space)) {
@@ -197,8 +198,8 @@ class DiffApprovalComponent {
 		}
 		if (data.length === 1) {
 			const normalized = data.toLowerCase();
-			if (normalized === "y" || normalized === "a") this.done(true);
-			else if (normalized === "n" || normalized === "d") this.done(false);
+			if (normalized === "y" || normalized === "a") this.done("allow");
+			else if (normalized === "n" || normalized === "d") this.done("deny");
 		}
 	}
 
@@ -221,7 +222,7 @@ class DiffApprovalComponent {
 				),
 			);
 		}
-		lines.push("", this.renderButtons(safeWidth), this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"));
+		lines.push("", this.renderButtons(safeWidth), this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter choose • deny asks what to do instead • no editing"));
 		return lines.flatMap((line) => wrapTextWithAnsi(line, safeWidth));
 	}
 
@@ -445,8 +446,8 @@ async function handleWrite(input: { path: string; content: string }, ctx: Extens
 		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
+	const decision = await requestDiffApprovalDecision(ctx, preview);
+	if (!decision.approved) return { block: true, reason: formatDeniedDiffReason("write", input.path, decision.feedback) };
 }
 
 async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
@@ -460,8 +461,8 @@ async function handleEdit(input: { path: string; edits: Array<{ oldText: string;
 		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
+	const decision = await requestDiffApprovalDecision(ctx, preview);
+	if (!decision.approved) return { block: true, reason: formatDeniedDiffReason("edit", input.path, decision.feedback) };
 }
 
 async function requestDangerousCommandApproval(ctx: ExtensionContext, command: string, reason: string | undefined): Promise<boolean> {
@@ -470,8 +471,8 @@ async function requestDangerousCommandApproval(ctx: ExtensionContext, command: s
 	return choice === "Allow";
 }
 
-async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
-	return await ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
+async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<ApprovalChoice> {
+	return await ctx.ui.custom<ApprovalChoice>((tui, theme, _keybindings, done) => {
 		const component = new DiffApprovalComponent(preview, theme, done);
 		return {
 			render: (width: number) => component.render(width),
@@ -482,6 +483,26 @@ async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview):
 			},
 		};
 	});
+}
+
+async function requestDiffApprovalDecision(ctx: ExtensionContext, preview: DiffPreview): Promise<DiffApprovalDecision> {
+	while (true) {
+		const choice = await requestDiffApproval(ctx, preview);
+		if (choice === "allow") return { approved: true };
+
+		const feedback = await ctx.ui.input(
+			`Tell pi what to do instead for ${preview.path}`,
+			"Optional. Blank = deny without feedback; Esc = back to diff review.",
+		);
+		if (feedback === undefined) continue;
+		const trimmedFeedback = feedback.trim();
+		return trimmedFeedback ? { approved: false, feedback: trimmedFeedback } : { approved: false };
+	}
+}
+
+function formatDeniedDiffReason(tool: DiffTool, filePath: string, feedback?: string): string {
+	const base = `Denied ${tool} after diff review: ${filePath}`;
+	return feedback ? `${base}\nUser instructions for what to do instead:\n${feedback}` : base;
 }
 
 function buildWriteDiffPreview(input: { path: string; content: string }, cwd: string): DiffPreview {
