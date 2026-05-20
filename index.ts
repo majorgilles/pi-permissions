@@ -20,13 +20,15 @@ const DIFF_PREVIEW_MAX_TOTAL_LINES = 26;
 const DIFF_PREVIEW_MIN_TOTAL_LINES = 8;
 const DIFF_PREVIEW_TERMINAL_MARGIN_LINES = 6;
 const DIFF_PREVIEW_MIN_BODY_LINES = 1;
+const DIFF_FEEDBACK_MAX_CHARS = 500;
 const DIFF_CELL_THRESHOLD = 4_000_000;
 
 type PermissionMode = "ask" | "auto";
 type DiffTool = "write" | "edit";
 type DiffLineKind = "added" | "removed" | "context" | "skip";
 type PermissionTheme = ExtensionContext["ui"]["theme"];
-type ApprovalChoice = "allow" | "deny";
+type ApprovalChoice = "allow" | "changes" | "deny";
+type DiffApprovalResult = { approved: true } | { approved: false; feedback?: string };
 
 type PermissionConfig = {
 	version?: number;
@@ -154,35 +156,43 @@ class DiffApprovalComponent {
 	private selected: ApprovalChoice = "allow";
 	private scrollOffset = 0;
 	private pageSize = DIFF_PREVIEW_MAX_BODY_LINES;
+	private feedback = "";
+	private feedbackCursor = 0;
+	private editingFeedback = false;
 	private highlightedOld: string[] | undefined;
 	private highlightedNew: string[] | undefined;
 
 	constructor(
 		private readonly preview: DiffPreview,
 		private readonly theme: PermissionTheme,
-		private readonly done: (approved: boolean) => void,
+		private readonly done: (result: DiffApprovalResult) => void,
 		private readonly getTerminalRows: () => number,
 	) {}
 
 	handleInput(data: string): void {
+		if (this.editingFeedback) {
+			this.handleFeedbackInput(data);
+			return;
+		}
+
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-			this.done(false);
+			this.deny();
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.done(this.selected === "allow");
+			this.submitSelectedChoice();
 			return;
 		}
 		if (matchesKey(data, Key.tab) || matchesKey(data, Key.space)) {
-			this.selected = this.selected === "allow" ? "deny" : "allow";
+			this.selected = this.nextChoice(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.left)) {
-			this.selected = "allow";
+			this.selected = this.previousChoice(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.right)) {
-			this.selected = "deny";
+			this.selected = this.nextChoice(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.up) || data === "k") {
@@ -203,8 +213,100 @@ class DiffApprovalComponent {
 		}
 		if (data.length === 1) {
 			const normalized = data.toLowerCase();
-			if (normalized === "y" || normalized === "a") this.done(true);
-			else if (normalized === "n" || normalized === "d") this.done(false);
+			if (normalized === "y" || normalized === "a") this.done({ approved: true });
+			else if (normalized === "n" || normalized === "d") this.deny();
+			else if (normalized === "c" || normalized === "r" || normalized === "e") this.startFeedback();
+		}
+	}
+
+	private submitSelectedChoice(): void {
+		if (this.selected === "allow") {
+			this.done({ approved: true });
+			return;
+		}
+		if (this.selected === "deny") {
+			this.deny();
+			return;
+		}
+		if (this.getNormalizedFeedback()) {
+			this.deny();
+			return;
+		}
+		this.startFeedback();
+	}
+
+	private startFeedback(): void {
+		this.selected = "changes";
+		this.editingFeedback = true;
+		this.feedbackCursor = this.feedback.length;
+	}
+
+	private deny(): void {
+		const feedback = this.getNormalizedFeedback();
+		this.done(feedback ? { approved: false, feedback } : { approved: false });
+	}
+
+	private getNormalizedFeedback(): string {
+		return this.feedback.trim().replace(/\s+/g, " ");
+	}
+
+	private previousChoice(choice: ApprovalChoice): ApprovalChoice {
+		if (choice === "allow") return "deny";
+		if (choice === "changes") return "allow";
+		return "changes";
+	}
+
+	private nextChoice(choice: ApprovalChoice): ApprovalChoice {
+		if (choice === "allow") return "changes";
+		if (choice === "changes") return "deny";
+		return "allow";
+	}
+
+	private handleFeedbackInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.editingFeedback = false;
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("c"))) {
+			this.deny();
+			return;
+		}
+		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+			this.deny();
+			return;
+		}
+		if (matchesKey(data, Key.left)) {
+			this.feedbackCursor = Math.max(0, this.feedbackCursor - 1);
+			return;
+		}
+		if (matchesKey(data, Key.right)) {
+			this.feedbackCursor = Math.min(this.feedback.length, this.feedbackCursor + 1);
+			return;
+		}
+		if (matchesKey(data, Key.home)) {
+			this.feedbackCursor = 0;
+			return;
+		}
+		if (matchesKey(data, Key.end)) {
+			this.feedbackCursor = this.feedback.length;
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			if (this.feedbackCursor > 0) {
+				this.feedback = this.feedback.slice(0, this.feedbackCursor - 1) + this.feedback.slice(this.feedbackCursor);
+				this.feedbackCursor--;
+			}
+			return;
+		}
+		if (matchesKey(data, Key.delete)) {
+			if (this.feedbackCursor < this.feedback.length) {
+				this.feedback = this.feedback.slice(0, this.feedbackCursor) + this.feedback.slice(this.feedbackCursor + 1);
+			}
+			return;
+		}
+		if (data.length === 1 && data.charCodeAt(0) >= 32 && this.feedback.length < DIFF_FEEDBACK_MAX_CHARS) {
+			this.feedback = this.feedback.slice(0, this.feedbackCursor) + data + this.feedback.slice(this.feedbackCursor);
+			this.feedbackCursor++;
 		}
 	}
 
@@ -212,10 +314,12 @@ class DiffApprovalComponent {
 		const safeWidth = Math.max(1, width);
 		const body = this.renderBody(safeWidth);
 		const headerLines = this.renderHeader(safeWidth).map((line) => truncateToWidth(line, safeWidth));
+		const feedbackLines = this.renderFeedbackLines(safeWidth);
+		const feedbackChromeLines = feedbackLines.length > 0 ? feedbackLines.length + 1 : 0;
 		const buttonLines = [this.renderButtons(safeWidth)];
-		const helpLines = [truncateToWidth(this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • enter approve/deny • esc deny • no editing"), safeWidth)];
+		const helpLines = [truncateToWidth(this.theme.fg("dim", "↑/↓ scroll • ←/→ choose • c request changes • enter confirm • esc deny"), safeWidth)];
 		const maxTotalLines = this.getMaxTotalLines();
-		const baseChromeLines = headerLines.length + 1 + 1 + buttonLines.length + helpLines.length;
+		const baseChromeLines = headerLines.length + 1 + feedbackChromeLines + 1 + buttonLines.length + helpLines.length;
 		let visibleBodyLineCount = Math.max(
 			DIFF_PREVIEW_MIN_BODY_LINES,
 			Math.min(DIFF_PREVIEW_MAX_BODY_LINES, maxTotalLines - baseChromeLines),
@@ -245,6 +349,9 @@ class DiffApprovalComponent {
 					safeWidth,
 				),
 			);
+		}
+		if (feedbackLines.length > 0) {
+			lines.push("", ...feedbackLines);
 		}
 		lines.push("", ...buttonLines, ...helpLines);
 		return lines.map((line) => (visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth) : line));
@@ -327,19 +434,38 @@ class DiffApprovalComponent {
 		return this.highlightedNew;
 	}
 
+	private renderFeedbackLines(width: number): string[] {
+		if (!this.editingFeedback && !this.feedback) return [];
+		const label = this.editingFeedback ? "Change request: " : "Requested changes: ";
+		const hint = this.editingFeedback ? this.theme.fg("dim", "  Enter sends • Esc keeps editing off") : "";
+		return [truncateToWidth(`${this.theme.fg("muted", label)}${this.renderFeedbackText()}${hint}`, width)];
+	}
+
+	private renderFeedbackText(): string {
+		if (!this.editingFeedback) return this.feedback || this.theme.fg("dim", "(none)");
+		const before = this.feedback.slice(0, this.feedbackCursor);
+		const cursorChar = this.feedbackCursor < this.feedback.length ? this.feedback[this.feedbackCursor] : " ";
+		const after = this.feedback.slice(this.feedbackCursor + 1);
+		return `${before}\x1b[7m${cursorChar}\x1b[27m${after}`;
+	}
+
 	private renderButtons(width: number): string {
 		const allow = this.renderButton("allow", "Allow");
+		const changes = this.renderButton("changes", "Request changes");
 		const deny = this.renderButton("deny", "Deny");
-		return truncateToWidth(`${allow} ${deny}`, width);
+		return truncateToWidth(`${allow} ${changes} ${deny}`, width);
 	}
 
 	private renderButton(choice: ApprovalChoice, label: string): string {
 		const base = ` ${label} `;
-		if (this.selected !== choice) {
-			return choice === "allow" ? this.theme.fg("success", base) : this.theme.fg("error", base);
-		}
-		const colored = choice === "allow" ? this.theme.fg("success", this.theme.bold(base)) : this.theme.fg("error", this.theme.bold(base));
-		return this.theme.bg("selectedBg", colored);
+		const colored = this.colorChoice(choice, this.selected === choice ? this.theme.bold(base) : base);
+		return this.selected === choice ? this.theme.bg("selectedBg", colored) : colored;
+	}
+
+	private colorChoice(choice: ApprovalChoice, text: string): string {
+		if (choice === "allow") return this.theme.fg("success", text);
+		if (choice === "changes") return this.theme.fg("warning", text);
+		return this.theme.fg("error", text);
 	}
 }
 
@@ -477,8 +603,8 @@ async function handleWrite(input: { path: string; content: string }, ctx: Extens
 		return { block: true, reason: `Could not prepare write diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied write after diff review: ${input.path}` };
+	const result = await requestDiffApproval(ctx, preview);
+	if (!result.approved) return { block: true, reason: `Denied write after diff review: ${input.path}${formatChangeRequest(result.feedback)}` };
 }
 
 async function handleEdit(input: { path: string; edits: Array<{ oldText: string; newText: string }> }, ctx: ExtensionContext) {
@@ -492,8 +618,8 @@ async function handleEdit(input: { path: string; edits: Array<{ oldText: string;
 		return { block: true, reason: `Could not prepare edit diff for approval: ${formatError(error)}` };
 	}
 
-	const approved = await requestDiffApproval(ctx, preview);
-	if (!approved) return { block: true, reason: `Denied edit after diff review: ${input.path}` };
+	const result = await requestDiffApproval(ctx, preview);
+	if (!result.approved) return { block: true, reason: `Denied edit after diff review: ${input.path}${formatChangeRequest(result.feedback)}` };
 }
 
 async function requestDangerousCommandApproval(ctx: ExtensionContext, command: string, reason: string | undefined): Promise<boolean> {
@@ -502,8 +628,8 @@ async function requestDangerousCommandApproval(ctx: ExtensionContext, command: s
 	return choice === "Allow";
 }
 
-async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<boolean> {
-	return await ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
+async function requestDiffApproval(ctx: ExtensionContext, preview: DiffPreview): Promise<DiffApprovalResult> {
+	return await ctx.ui.custom<DiffApprovalResult>((tui, theme, _keybindings, done) => {
 		const component = new DiffApprovalComponent(preview, theme, done, () => tui.terminal.rows);
 		return {
 			render: (width: number) => component.render(width),
@@ -919,6 +1045,10 @@ function getErrorCode(error: unknown): string | undefined {
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function formatChangeRequest(feedback: string | undefined): string {
+	return feedback ? `; user requested changes: ${feedback}` : "";
 }
 
 function resolveForPolicy(filePath: string, cwd: string): string {
